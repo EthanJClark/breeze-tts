@@ -1,52 +1,18 @@
-<div align="center">
-  <a href="https://breezeblue.ai/"><img src="assets/breezeblue-logo.png" alt="BreezeBlue" width="35%"></a>
-  <br><br>
-  <a href="https://huggingface.co/BreezeBlue/breeze-tts-2"><img src="https://img.shields.io/badge/Hugging%20Face-breeze--tts--2-FFD21E" alt="Hugging Face"></a>
-  <a href="https://breezeblue.ai/breeze-tts-2"><img src="https://img.shields.io/badge/Blog-Breeze%20TTS%202-2563EB" alt="Blog"></a>
-  <a href="https://breezeblue.ai/"><img src="https://img.shields.io/badge/Website-BreezeBlue-0EA5E9" alt="Website"></a>
-  <a href="https://discord.com/invite/6H7AgPe9pA"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://x.com/BreezeBlueX"><img src="https://img.shields.io/badge/X-Follow%20BreezeBlue-000000?logo=x&logoColor=white" alt="X"></a>
-</div>
+# Breeze TTS 2 — Getting Started
 
-> New here? See [GETTING_STARTED.md](GETTING_STARTED.md) for a short quick-start guide.
+A short version of the official [README](README.md), plus how to launch the local Web UI.
 
-> [!IMPORTANT]
-> Source code is licensed under Apache 2.0. Breeze TTS 2 model weights, derivative models, and self-hosted outputs are for research and non-commercial use only. See [License](#license-and-responsible-use).
-
-## 📰 News
-
-- **[2026.08.25]** 🎉 We release [Breeze TTS 2](https://huggingface.co/BreezeBlue/breeze-tts-2) model weights and the [PyTorch inference code](https://github.com/breezeblue-ai/breeze-tts).
-- **[2026.08.07]** 🔥 We release the TTS benchmark suite for [voice design](https://github.com/breezeblue-ai/tts-voice-design-benchmark), [voice direction](https://github.com/breezeblue-ai/TTS-Voice-Direction-Benchmark), and [latency evaluation](https://github.com/breezeblue-ai/TTS-Latency-Benchmark).
-
-## 📖 Introduction
-
-Breeze TTS 2 is an open-weight text-to-speech model built for real-time interaction. It ranks #1 among open-weight models on the Artificial Analysis TTS leaderboard, while outperforming frontier proprietary systems. Its open-ended natural-language instruction-following capability supports reference-free voice design and reference-guided voice direction, while ultra-low-latency streaming enables responsive, expressive interaction.
-
-<div align="center">
-  <img src="assets/tts-elo-leaderboard.svg" alt="Text-to-speech models ranked by Artificial Analysis Elo score" width="100%">
-</div>
-
-## ✨ Highlights
-
-- 🎙️ **Voice Clone** — Uses reference audio with its exact transcript to preserve timbre, rhythm, emotion, and style.
-- 🎨 **Voice Design** — Creates a distinctive voice from a natural-language description, without reference audio.
-- 🎛️ **Voice Direction** — Clones a voice from reference audio while steering tone, emotion, pace, and delivery.
-- 🎭 **Vocal Events** — Adds expressive inline events directly in the text: use parentheses in English, such as `(laugh)`, `(cough)`, `(clears throat)`, and `(sigh)`; use square brackets in Chinese, such as `[笑]`, `[咳嗽]`, `[清嗓子]`, and `[叹气]`.
-- ⚡ **Ultra-Low Latency** — Achieves under 40 ms time to first audio (TTFA) with the warmed-up fast path on an NVIDIA H100.
-- 🌊 **Real-Time Streaming** — Reaches a 0.32 real-time factor (RTF), generating audio at approximately 3.1× real time with the warmed-up fast path on an NVIDIA H100.
-- 💾 **GPU-Efficient** — Eager inference uses approximately 7.7 GiB of GPU memory; a 12 GB GPU is the minimum recommended configuration.
-- 🌏 **Bilingual Support** — Generates natural English and Chinese speech with a single model.
-
-## 🚀 Quick Start
-
-### Requirements
+## Requirements
 
 - Linux and Python 3.10 or newer
 - A CUDA-capable NVIDIA GPU
-- GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path
+- GPU memory: about 7.7 GiB for eager inference, or 14.4 GiB with `--fast-all`
+- A 12 GB GPU for eager mode, or a 24 GB GPU for the fast path
 - The Breeze TTS 2 checkpoint
 
-### Installation
+> Use Python 3.10–3.13. The pinned PyTorch 2.9.1 build fails on Python 3.14.
+
+## Installation
 
 Download the inference code:
 
@@ -55,7 +21,14 @@ git clone https://github.com/breezeblue-ai/breeze-tts.git
 cd breeze-tts
 ```
 
-Install the dependencies:
+Create and activate a virtual environment so the dependencies stay isolated:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Then install the dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -63,75 +36,38 @@ python -m pip install -r requirements.txt
 
 All required model components are included in the Breeze TTS 2 checkpoint.
 
-For the tested CUDA environment, build the included Docker image:
+## Checkpoint
 
-```bash
-bash docker/build.sh
+Use a local checkpoint directory, or pass the Hugging Face repo id and let the API download it into the standard cache.
+
+```text
+../breeze-tts-2
+BreezeBlue/breeze-tts-2
 ```
 
-The default image targets H100/Hopper (sm90). For A100:
+## CLI
 
-```bash
-FLASH_ATTN_CUDA_ARCHS=80 bash docker/build.sh
-```
-
-### 🎙️ Voice Clone
-
-Clone a speaker from clean reference audio and its exact transcript.
-
-#### English
-
-```bash
-python infer.py ../breeze-tts-2 \
-  --ref-audio reference_en.wav \
-  --ref-text "This is the exact transcript of the English reference audio." \
-  --text "(sigh) It is good to hear your voice again after all this time." \
-  --output outputs/voice_clone_en.wav
-```
-
-#### Chinese
-
-```bash
-python infer.py ../breeze-tts-2 \
-  --ref-audio reference_zh.wav \
-  --ref-text "这是中文参考音频的准确文字稿。" \
-  --text "[叹气] 没想到过了这么久，你还记得我的声音。" \
-  --output outputs/voice_clone_zh.wav
-```
-
-Reference audio should contain clean, non-looping speech with minimal background
-noise. `--ref-text` should match the complete spoken content of the reference
-audio; if speech is repeated in the audio, include those repetitions in the
-transcript. Voice Clone does not use an instruction. Adding `--instruction`
-selects Voice Direction instead.
-
-### 🎨 Voice Design
-
-Create a voice from a natural-language description without reference audio. Match the instruction language to the target text. Use `--cfg-scale 4` to strengthen instruction-following.
-
-#### English
+Voice design, no reference audio:
 
 ```bash
 python infer.py ../breeze-tts-2 \
   --text "(sigh) Welcome aboard. Your journey begins now." \
   --instruction "A warm, thoughtful young woman with a clear voice and a calm, reflective delivery." \
   --cfg-scale 4 \
-  --output outputs/voice_design_en.wav
+  --output outputs/voice_design.wav
 ```
 
-#### Chinese
+Voice clone, reference audio plus its exact transcript:
 
 ```bash
 python infer.py ../breeze-tts-2 \
-  --text "[笑] 欢迎来到今晚的故事时间，让我们一起开始吧。" \
-  --instruction "一位温柔自信的年轻女性，声音清晰，语气亲切，表达轻快而富有感染力。" \
-  --cfg-scale 4 \
-  --output outputs/voice_design_zh.wav
+  --ref-audio reference.wav \
+  --ref-text "This is the exact transcript of the reference audio." \
+  --text "(sigh) It is good to hear your voice again." \
+  --output outputs/voice_clone.wav
 ```
 
-### 🎛️ Voice Direction
-
-Keep the identity of a reference speaker while directing tone, emotion, pace, and delivery. Use `--cfg-scale 4` to strengthen instruction-following.
+Voice direction, clone plus delivery instruction:
 
 ```bash
 python infer.py ../breeze-tts-2 \
@@ -143,15 +79,11 @@ python infer.py ../breeze-tts-2 \
   --output outputs/voice_direction.wav
 ```
 
-### 🌐 Streaming API
-
-Start the single-concurrency streaming API. It uses the same PyTorch runtime and eager execution by default:
+## Streaming API
 
 ```bash
 python -m breeze_infer.api ../breeze-tts-2 --host 0.0.0.0 --port 7860
 ```
-
-Send a Voice Direction request with reference audio and CFG 4:
 
 ```bash
 curl -X POST http://127.0.0.1:7860/v1/audio/speech \
@@ -166,36 +98,23 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM. Start the API with `--fast-all` to enable the fast path.
 
-Both speech endpoints accept `temperature` (default `0.9`, range `0 < temperature <= 2.0`). `/v1/audio/speech` also accepts `top_p` (default `1.0`), `top_k` (default `50`), `repetition_penalty` (default `1.1`), and `max_new_tokens` (default `1500`). Lower temperature is steadier; higher temperature and top-p are more varied. The CLI exposes temperature as `--temperature`.
+## Web UI
 
-The model argument is either a local checkpoint directory or a Hugging Face repo id. Repo ids are downloaded into the standard Hugging Face cache; pass `--revision` to pin a branch, tag, or commit (ignored for local directories):
-
-```bash
-python -m breeze_infer.api BreezeBlue/breeze-tts-2 --revision main --host 0.0.0.0 --port 7860
-```
-
-### 🖥️ Web UI
-
-A Gradio interface is included. It talks to the streaming API, so start the API first and then run the UI in another terminal:
+Start the API first, then run the UI in another terminal:
 
 ```bash
-python -m breeze_infer.api ../breeze-tts-2 --host 0.0.0.0 --port 7860
 python webui.py --api-url http://127.0.0.1:7860
 ```
 
-Open http://127.0.0.1:7861. The UI does not load the model, so it starts instantly and can point at a remote GPU server with `--api-url`.
+Open **http://127.0.0.1:7861**.
 
-The interface has three tabs:
+- **Generate** — script, voice description, performance direction, presets, saved reference voices, takes, and stop.
+- **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, seed, and timeout.
+- **Library** — saved instructions, reference voices, and scripts.
 
-- **Generate** — script, voice description, performance direction, instruction presets, delivery presets, saved reference voices, inline vocal-event buttons, multiple takes, and stop control. Voice design, cloning, and direction share this one form.
-- **Settings** — CFG scale, temperature, top-p, top-k, repetition penalty, max duration, takes, seed mode, request timeout, and autoplay. Save settings to persist them across restarts.
-- **Library** — manage instruction presets, reference voice profiles (audio plus exact transcript), and reusable scripts.
+Saved data lives in `~/.local/share/breeze-tts/`; override it with `--data-dir`.
 
-State lives in `~/.local/share/breeze-tts/` and can be moved with `--data-dir` or `BREEZE_DATA_DIR`. `--presets-file` overrides just the instruction presets file. Saved voices keep their audio under `references/`.
-
-### 📦 Batch API
-
-For offline synthesis, send many texts in one request. Decoding one sequence at a time is memory-bandwidth bound, so a batch finishes much faster than the same texts sent one by one:
+## Batch API
 
 ```bash
 curl -X POST http://127.0.0.1:7860/v1/audio/speech/batch \
@@ -204,49 +123,13 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech/batch \
   -F "cfg_scale=4" \
   -F "seed=42" \
   -F "max_new_tokens=600" \
-  --dump-header headers.txt \
   --output batch.pcm
 ```
 
-`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500.
+`texts` is a JSON array of up to 128 non-empty strings. The response is the concatenated PCM of every segment; `X-Segment-Bytes` gives each segment's length.
 
-Batch inference is opt-in: its GPU memory grows with batch size and sequence length, so start with a small batch and increase it to fit your GPU. The 7.7 GiB / 12 GB recommendation above describes single-request eager inference, not a 128-text batch. Batch support keeps its backup weights on CPU and does not add GPU allocations to single-request inference.
+## Notes
 
-Batches use eager text encoding and backbone generation; CFG batches (`cfg_scale != 1`) accelerate depth decoding with CUDA Graphs. A graph is captured lazily for the active batch-size bucket and reused; switching buckets replaces it rather than retaining all sizes. The first request in a bucket includes capture overhead. Plain cloning with `cfg_scale=1` does not create a batch graph. Batch graph memory is allocated only after requesting CFG batch synthesis and remains cached for reuse.
-
-Batches share the single inference slot with streaming requests; a request made while another is running returns `409`.
-
-The response body is the mono 24 kHz s16le PCM of every segment concatenated in request order. `X-Segment-Bytes` lists each segment's byte length, comma separated, so the body can be split back into segments.
-
-`GET /v1/model` reports the loaded checkpoint and the server limits:
-
-```json
-{"frame_rate": 12.5, "model_digest": "<sha256>", "max_new_tokens": 1500, "max_batch_texts": 128}
-```
-
-`frame_rate` is the codec frame rate (tokens per second of audio), useful for sizing `max_new_tokens`. `model_digest` is a SHA-256 over the checkpoint config, safetensors index (if present), and all referenced model weight files. It is computed once at startup using bounded-memory reads, distinguishes changed weights, and is independent of the checkpoint directory.
-
-### ⚡ Fast Inference Options
-
-Both the CLI and API use eager streaming by default and skip graph warmup. Pass `--fast-all` to enable the best configuration for every inference stage when the additional cold-start time is acceptable. Each stage can also be controlled independently:
-
-| Stage | Fast parameter | Disabled | Enabled |
-| --- | --- | --- | --- |
-| Text encoder | `--[no-]fast-text-encoder` | Native eager forward | Static CUDA Graph selected by CFG shape and text-length bucket |
-| Backbone prefill | `--[no-]fast-backbone-prefill` | Native eager prefill | CUDA Graph selected by CFG shape and prompt-length bucket |
-| Backbone decode | `--[no-]fast-backbone-decode` | Native eager token step | StaticCache-backed graph selected by CFG shape |
-| Depth decoder | `--[no-]fast-depth-decoder` | Native eager depth loop | Full-graph compilation with CFG-shape CUDA Graphs |
-| Codec | `--[no-]fast-codec` | Eager streaming decode | Single-request streaming CUDA Graph with one-frame chunks |
-
-Individual stage flags are intended for profiling and debugging.
-
-
-## License and Responsible Use
-
-The source code is licensed under the [Apache License, Version 2.0](https://github.com/breezeblue-ai/breeze-tts/blob/main/LICENSE). The audio tokenizer is based on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by the Alibaba Qwen Team and is licensed under the Apache License, Version 2.0. Model weights, checkpoints, adapters, derivative models, and self-hosted outputs are governed separately by the [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE). The Apache License does not grant rights to use the model commercially.
-
-If you have an active paid subscription, outputs you generate through BreezeBlue's hosted platform or API at [breezeblue.ai](https://breezeblue.ai/) can be used commercially, subject to our [Terms of Service](https://breezeblue.ai/legal/terms). A paid subscription does not grant commercial rights to the open-weight model or self-hosted outputs.
-
-You are responsible for complying with applicable laws and obtaining all necessary rights and consents for inputs, reference audio, voices, and outputs. Unauthorized voice cloning, impersonation, fraud, and other unlawful or harmful uses are prohibited.
-
-The code and Model Materials are provided "AS IS," without warranties or liability to the maximum extent permitted by law. Third-party components remain subject to their respective licenses.
+- The API handles one request at a time; a concurrent request returns `409`.
+- `--fast-all` enables every optimized stage. Eager execution is the default and needs no extra build tools.
+- Model weights and self-hosted outputs are for research and non-commercial use only. See the [README](README.md#license-and-responsible-use) for the full license.

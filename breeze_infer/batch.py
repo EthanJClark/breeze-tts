@@ -53,20 +53,22 @@ class BatchDepthDecoder:
         self.max_batch_size = max_batch_size
         self.graph = None
         self.bucket_size = None
+        self.temperature: float | None = None
 
     def prepare(self, batch_size: int) -> None:
         """Keep only the current bucket; never preallocate all batch sizes."""
         if not 1 <= batch_size <= self.max_batch_size:
             raise ValueError(f"Unsupported batch size: {batch_size}")
         bucket = 2 * (1 << (batch_size - 1).bit_length())
+        model = self.model
+        depth_decoder = model.depth_decoder
+        generation_config = depth_decoder.generation_config
+        self.temperature = float(generation_config.temperature)
         if self.graph is not None and self.bucket_size == bucket:
             return
         # Drop the previous graph before allocating its replacement.
         self.graph = None
         self.bucket_size = None
-        model = self.model
-        depth_decoder = model.depth_decoder
-        generation_config = depth_decoder.generation_config
         top_p = generation_config.top_p
         self.graph = DepthDecoderGraph(
             depth_decoder=depth_decoder,
@@ -76,7 +78,7 @@ class BatchDepthDecoder:
             do_sample=bool(generation_config.do_sample),
             top_k=int(generation_config.top_k or 0),
             top_p=1.0 if top_p is None else float(top_p),
-            temperature=float(generation_config.temperature),
+            temperature=float(self.temperature),
             num_codebooks=model.config.num_codebooks,
             codec_codebook_size=int(model.config.codec_config.codebook_size),
             batch_size=bucket,
@@ -98,7 +100,10 @@ class BatchDepthDecoder:
         if self.graph is None:
             raise RuntimeError("Batch depth graph must be prepared before generation")
         codebooks = self.graph.run(
-            backbone_hidden, first_codebook, guidance_scale=cfg_scale
+            backbone_hidden,
+            first_codebook,
+            guidance_scale=cfg_scale,
+            temperature=self.temperature,
         )
         return torch.cat(
             [depth_decoder_input_ids, codebooks.to(depth_decoder_input_ids.dtype)],

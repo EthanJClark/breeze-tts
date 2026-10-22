@@ -1,4 +1,6 @@
 .git
+.venv
+.venv*
 .env
 .env.*
 !.env.example
@@ -12,6 +14,7 @@ htmlcov
 runs
 outputs
 *.wav
+*.pcm
 *.mp3
 *.flac
 *.pt

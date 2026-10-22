@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -46,10 +47,22 @@ def test_speech_request_parameters_are_minimal() -> None:
         "text",
         "instruction",
         "cfg_scale",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+        "max_new_tokens",
         "ref_audio",
         "ref_text",
         "seed",
     ]
+
+
+def test_api_temperature_defaults_to_09() -> None:
+    temperature_parameter = inspect.signature(speech).parameters["temperature"]
+
+    assert api.DEFAULT_TEMPERATURE == 0.9
+    assert temperature_parameter.default.default == 0.9
 
 
 def test_api_cfg_defaults_to_one() -> None:
@@ -106,8 +119,10 @@ def test_streaming_reseeds_immediately_before_model_sampling(monkeypatch) -> Non
 
 class FakeBatchModel:
     def __init__(self, lengths: list[int] | None = None) -> None:
+        self.generation_config = SimpleNamespace(temperature=0.9)
         self.depth_decoder = SimpleNamespace(
-            model=SimpleNamespace(layers=[], norm=torch.nn.Identity())
+            model=SimpleNamespace(layers=[], norm=torch.nn.Identity()),
+            generation_config=SimpleNamespace(temperature=0.9),
         )
         self.lengths = lengths
         self.calls = []
@@ -185,11 +200,105 @@ def _post_batch(client: TestClient, texts, **data):
     return client.post("/v1/audio/speech/batch", data={"texts": texts, **data})
 
 
+def _speech_state(monkeypatch):
+    model = FakeBatchModel()
+    runtime = SimpleNamespace(sample_rate=24000, limits={})
+
+    def set_request_limits(**kwargs):
+        runtime.limits = kwargs
+
+    runtime.set_request_limits = set_request_limits
+    monkeypatch.setattr(api, "prepare_inputs", lambda *args, **kwargs: {})
+    monkeypatch.setattr(app.state, "tokenizer", object(), raising=False)
+    monkeypatch.setattr(app.state, "audio_tokenizer", object(), raising=False)
+    monkeypatch.setattr(app.state, "model", model, raising=False)
+    monkeypatch.setattr(app.state, "runtime", runtime, raising=False)
+    return model, runtime
+
+
+def _speech_kwargs(**overrides):
+    values = {
+        "text": "hello",
+        "instruction": "a calm narrator",
+        "cfg_scale": 4.0,
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repetition_penalty": 1.1,
+        "max_new_tokens": 100,
+        "ref_audio": None,
+        "ref_text": "",
+        "seed": 42,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_speech_applies_sampling(monkeypatch) -> None:
+    model, runtime = _speech_state(monkeypatch)
+
+    response = asyncio.run(
+        speech(
+            **_speech_kwargs(
+                temperature=1.2,
+                top_p=0.9,
+                top_k=40,
+                repetition_penalty=1.25,
+                max_new_tokens=123,
+            )
+        )
+    )
+    try:
+        assert model.generation_config.temperature == 1.2
+        assert model.generation_config.top_p == 0.9
+        assert model.generation_config.top_k == 40
+        assert model.depth_decoder.generation_config.temperature == 1.2
+        assert model.depth_decoder.generation_config.top_p == 0.9
+        assert model.depth_decoder.generation_config.top_k == 40
+        assert runtime.limits["repetition_penalty"] == 1.25
+        assert runtime.limits["max_new_tokens"] == 123
+    finally:
+        response._close()
+
+    assert not api._request_lock.locked()
+
+
+def test_speech_clamps_max_new_tokens(monkeypatch) -> None:
+    _, runtime = _speech_state(monkeypatch)
+
+    response = asyncio.run(speech(**_speech_kwargs(max_new_tokens=99999)))
+    try:
+        assert runtime.limits["max_new_tokens"] == api.MAX_NEW_TOKENS
+    finally:
+        response._close()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"top_p": 0.0},
+        {"top_p": 1.5},
+        {"top_k": -1},
+        {"repetition_penalty": 0.0},
+        {"temperature": 0.0},
+    ],
+)
+def test_speech_rejects_invalid_sampling(monkeypatch, overrides) -> None:
+    _speech_state(monkeypatch)
+
+    with pytest.raises(api.HTTPException) as error:
+        asyncio.run(speech(**_speech_kwargs(**overrides)))
+
+    assert error.value.status_code == 400
+    assert not api._request_lock.locked()
+
+
 def test_batch_speech_parameters() -> None:
     assert list(inspect.signature(api.speech_batch).parameters) == [
         "texts",
         "instruction",
         "cfg_scale",
+        "temperature",
         "ref_audio",
         "ref_text",
         "seed",
@@ -223,6 +332,23 @@ def test_batch_rejects_invalid_cfg_scale(batch_client) -> None:
 
     assert response.status_code == 400
     assert not api._request_lock.locked()
+
+
+@pytest.mark.parametrize("temperature", ["0", "-0.1", "nan", "2.01"])
+def test_batch_rejects_invalid_temperature(batch_client, temperature) -> None:
+    response = _post_batch(batch_client, ["hello"], temperature=temperature)
+
+    assert response.status_code == 400
+    assert batch_client.model.calls == []
+    assert not api._request_lock.locked()
+
+
+def test_batch_applies_temperature(batch_client) -> None:
+    response = _post_batch(batch_client, ["hello"], temperature="1.25")
+
+    assert response.status_code == 200
+    assert batch_client.model.generation_config.temperature == 1.25
+    assert batch_client.model.depth_decoder.generation_config.temperature == 1.25
 
 
 def test_batch_requires_ref_audio_and_ref_text_together(batch_client) -> None:
@@ -474,7 +600,9 @@ def test_read_frame_rate_requires_codec_frame_rate(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("index", [True, False])
-def test_model_digest_tracks_weights_and_config_but_not_location(tmp_path, index) -> None:
+def test_model_digest_tracks_weights_and_config_but_not_location(
+    tmp_path, index
+) -> None:
     first, second = tmp_path / "a", tmp_path / "b"
     _write_checkpoint(first, index=index)
     _write_checkpoint(second, index=index)
@@ -490,7 +618,12 @@ def test_model_digest_tracks_weights_and_config_but_not_location(tmp_path, index
 
 def test_model_digest_requires_all_indexed_shards(tmp_path) -> None:
     _write_checkpoint(tmp_path)
-    index = {"weight_map": {"a": "model-00001-of-00001.safetensors", "b": "missing.safetensors"}}
+    index = {
+        "weight_map": {
+            "a": "model-00001-of-00001.safetensors",
+            "b": "missing.safetensors",
+        }
+    }
     (tmp_path / api.MODEL_INDEX_FILE).write_text(json.dumps(index))
     with pytest.raises(FileNotFoundError):
         api.compute_model_digest(tmp_path)

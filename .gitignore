@@ -2,6 +2,10 @@ runs/
 outputs/
 warmup_manifest.json
 *.wav
+*.pcm
+
+.venv/
+.venv*/
 
 __pycache__/
 *.py[cod]
@@ -12,6 +16,12 @@ __pycache__/
 .mypy_cache/
 .coverage
 htmlcov/
+
+settings.json
+instruction_presets.json
+scripts.json
+voice_profiles.json
+references/
 
 .env
 .env.*

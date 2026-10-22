@@ -4,7 +4,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -207,6 +207,20 @@ class FastBreezeStreamingRuntime:
     @property
     def sample_rate(self) -> int:
         return int(self.model.config.codec_config.sampling_rate)
+
+    def set_request_limits(
+        self, *, repetition_penalty: float, max_new_tokens: int
+    ) -> None:
+        """Apply per-request values without mutating the frozen config in place."""
+        if not repetition_penalty > 0:
+            raise ValueError("repetition_penalty must be greater than 0")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+        self.config = replace(
+            self.config,
+            repetition_penalty=float(repetition_penalty),
+            max_new_tokens=int(max_new_tokens),
+        )
 
     def _sampling_params(self, generation_config: Any) -> dict[str, Any]:
         def _value(name: str, override: Any, default: Any) -> Any:

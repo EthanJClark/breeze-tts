@@ -35,9 +35,14 @@ def test_cancelled_batch_keeps_lock_and_reference_until_worker_exits(
 
     async def request():
         return await api.speech_batch(
-            texts='["Hello"]', instruction=None, cfg_scale=1,
+            texts='["Hello"]',
+            instruction=None,
+            cfg_scale=1,
+            temperature=api.DEFAULT_TEMPERATURE,
             ref_audio=SimpleNamespace(filename="reference.wav"),
-            ref_text="reference", seed=1, max_new_tokens=10,
+            ref_text="reference",
+            seed=1,
+            max_new_tokens=10,
         )
 
     async def run():
@@ -75,9 +80,14 @@ def test_cancelled_batch_upload_releases_resources(monkeypatch):
     async def run():
         with pytest.raises(asyncio.CancelledError):
             await api.speech_batch(
-                texts='["Hello"]', instruction=None, cfg_scale=1,
+                texts='["Hello"]',
+                instruction=None,
+                cfg_scale=1,
+                temperature=api.DEFAULT_TEMPERATURE,
                 ref_audio=SimpleNamespace(filename="reference.wav"),
-                ref_text="reference", seed=1, max_new_tokens=10,
+                ref_text="reference",
+                seed=1,
+                max_new_tokens=10,
             )
         assert not api._request_lock.locked()
 

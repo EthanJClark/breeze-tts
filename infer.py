@@ -10,10 +10,13 @@ from pathlib import Path
 import soundfile as sf
 
 from breeze_infer.runtime import (
+    DEFAULT_TEMPERATURE,
     load_runtime,
     resolve_device,
     set_all_seeds,
+    set_generation_temperature,
     update_generation_config_for_breeze,
+    validate_temperature,
 )
 from breeze_infer.templates import get_template, prepare_inputs, select_template_name
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
@@ -37,6 +40,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("output.wav"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cfg-scale", type=float, default=DEFAULT_CFG_SCALE)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument(
         "--fast-all", action=argparse.BooleanOptionalAction, default=None
     )
@@ -59,6 +63,10 @@ def main() -> None:
 
     if not math.isfinite(args.cfg_scale) or args.cfg_scale <= 0:
         raise ValueError("--cfg-scale must be greater than 0")
+    try:
+        validate_temperature(args.temperature)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     has_ref_audio = args.ref_audio is not None
     has_ref_text = bool(args.ref_text and args.ref_text.strip())
@@ -73,6 +81,7 @@ def main() -> None:
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
+    set_generation_temperature(model, args.temperature)
 
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,

@@ -27,10 +27,19 @@ from transformers.generation.logits_process import LogitsProcessorList
 
 from breeze_infer.batch import BatchDepthDecoder, eager_batch_modules
 from breeze_infer.runtime import (
+    DEFAULT_REPETITION_PENALTY,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     load_runtime,
     resolve_device,
     set_all_seeds,
+    set_generation_sampling,
     update_generation_config_for_breeze,
+    validate_repetition_penalty,
+    validate_temperature,
+    validate_top_k,
+    validate_top_p,
 )
 from breeze_infer.templates import get_template, prepare_inputs, select_template_name
 from models.fast_streaming import (
@@ -46,7 +55,7 @@ FAST_CONFIG = REPO_ROOT / "configs" / "fast.json"
 DEFAULT_CFG_SCALE = 1.0
 MAX_NEW_TOKENS = 1500
 MAX_SEQ_LEN = 2048
-REPETITION_PENALTY = 1.1
+REPETITION_PENALTY = DEFAULT_REPETITION_PENALTY
 OPTIONAL_AUDIO_FILE = File(None)
 MAX_BATCH_TEXTS = 128
 MODEL_CONFIG_FILE = "config.json"
@@ -352,6 +361,11 @@ async def speech(
     text: str = Form(...),
     instruction: str | None = Form(None),
     cfg_scale: float = Form(DEFAULT_CFG_SCALE),
+    temperature: float = Form(DEFAULT_TEMPERATURE),
+    top_p: float = Form(DEFAULT_TOP_P),
+    top_k: int = Form(DEFAULT_TOP_K),
+    repetition_penalty: float = Form(DEFAULT_REPETITION_PENALTY),
+    max_new_tokens: int = Form(MAX_NEW_TOKENS),
     ref_audio: UploadFile | None = OPTIONAL_AUDIO_FILE,
     ref_text: str = Form(""),
     seed: int = Form(42),
@@ -375,6 +389,14 @@ async def speech(
             raise HTTPException(
                 status_code=400, detail="cfg_scale must be greater than 0."
             )
+        try:
+            temperature = validate_temperature(temperature)
+            top_p = validate_top_p(top_p)
+            top_k = validate_top_k(top_k)
+            repetition_penalty = validate_repetition_penalty(repetition_penalty)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        max_new_tokens = max(1, min(max_new_tokens, MAX_NEW_TOKENS))
         ref_text = ref_text.strip()
         has_reference = ref_audio is not None and bool(ref_audio.filename)
         if has_reference != bool(ref_text):
@@ -400,6 +422,13 @@ async def speech(
             request["ref_text"] = ref_text
         template_name = select_template_name(request)
 
+        set_generation_sampling(
+            app.state.model, temperature=temperature, top_p=top_p, top_k=top_k
+        )
+        app.state.runtime.set_request_limits(
+            repetition_penalty=repetition_penalty,
+            max_new_tokens=max_new_tokens,
+        )
         set_all_seeds(seed)
         inputs = prepare_inputs(
             app.state.tokenizer,
@@ -471,6 +500,7 @@ def _generate_batch_pcm(
     *,
     instruction: str | None,
     cfg_scale: float,
+    temperature: float,
     seed: int,
     reference_path: Path | None,
     ref_text: str,
@@ -498,6 +528,12 @@ def _generate_batch_pcm(
         requests.append(request)
     template_name = select_template_name(requests[0])
 
+    set_generation_sampling(
+        app.state.model,
+        temperature=temperature,
+        top_p=DEFAULT_TOP_P,
+        top_k=DEFAULT_TOP_K,
+    )
     set_all_seeds(seed)
     inputs = prepare_inputs(
         app.state.tokenizer,
@@ -547,6 +583,7 @@ async def speech_batch(
     texts: str = Form(...),
     instruction: str | None = Form(None),
     cfg_scale: float = Form(DEFAULT_CFG_SCALE),
+    temperature: float = Form(DEFAULT_TEMPERATURE),
     ref_audio: UploadFile | None = OPTIONAL_AUDIO_FILE,
     ref_text: str = Form(""),
     seed: int = Form(42),
@@ -578,6 +615,10 @@ async def speech_batch(
             raise HTTPException(
                 status_code=400, detail="cfg_scale must be greater than 0."
             )
+        try:
+            temperature = validate_temperature(temperature)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         max_new_tokens = max(1, min(max_new_tokens, MAX_NEW_TOKENS))
         ref_text = ref_text.strip()
         has_reference = ref_audio is not None and bool(ref_audio.filename)
@@ -596,6 +637,7 @@ async def speech_batch(
                     parsed_texts,
                     instruction=instruction.strip() if instruction else None,
                     cfg_scale=cfg_scale,
+                    temperature=temperature,
                     seed=seed,
                     reference_path=reference_path,
                     ref_text=ref_text,

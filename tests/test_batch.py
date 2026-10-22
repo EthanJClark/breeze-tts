@@ -10,8 +10,10 @@ class FakeGraph:
     def __init__(self) -> None:
         self.calls = []
 
-    def run(self, backbone_hidden, first_codebook, *, guidance_scale):
-        self.calls.append((backbone_hidden, first_codebook, guidance_scale))
+    def run(self, backbone_hidden, first_codebook, *, guidance_scale, temperature=None):
+        self.calls.append(
+            (backbone_hidden, first_codebook, guidance_scale, temperature)
+        )
         rows = backbone_hidden.shape[0] // 2
         return torch.arange(rows * 3).view(rows, 3) + 100
 
@@ -19,6 +21,7 @@ class FakeGraph:
 def _decoder() -> BatchDepthDecoder:
     decoder = BatchDepthDecoder.__new__(BatchDepthDecoder)
     decoder.graph = FakeGraph()
+    decoder.temperature = 0.9
     return decoder
 
 
@@ -35,10 +38,13 @@ def test_generate_with_cfg_pairs_cond_and_uncond_rows() -> None:
         cfg_scale=4.0,
     )
 
-    ((backbone_hidden, first_codebook, guidance_scale),) = decoder.graph.calls
+    ((backbone_hidden, first_codebook, guidance_scale, temperature),) = (
+        decoder.graph.calls
+    )
     assert torch.equal(backbone_hidden, torch.cat([cond, uncond]))
     assert first_codebook.tolist() == [5, 7, 5, 7]
     assert guidance_scale == 4.0
+    assert temperature == 0.9
     assert sequences.tolist() == [[0, 5, 100, 101, 102], [0, 7, 103, 104, 105]]
     assert sequences.dtype == input_ids.dtype
 

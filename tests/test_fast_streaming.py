@@ -179,3 +179,19 @@ def test_single_cfg_merges_cond_and_uncond_in_one_batched_text_path() -> None:
 
     assert eager_branch.branch_batch_size == 2
     assert len(runtime.model.calls) == 2
+
+
+def test_set_request_limits_replaces_frozen_config() -> None:
+    runtime = object.__new__(FastBreezeStreamingRuntime)
+    runtime.config = FastStreamingConfig(repetition_penalty=1.1, max_new_tokens=1500)
+
+    runtime.set_request_limits(repetition_penalty=1.25, max_new_tokens=200)
+
+    assert runtime.config.repetition_penalty == 1.25
+    assert runtime.config.max_new_tokens == 200
+
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        runtime.set_request_limits(repetition_penalty=0, max_new_tokens=200)
+
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        runtime.set_request_limits(repetition_penalty=1.1, max_new_tokens=0)

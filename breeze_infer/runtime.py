@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import random
 from pathlib import Path
@@ -10,6 +11,62 @@ import torch
 from transformers import AutoTokenizer
 
 from models.breeze import BreezeForConditionalGeneration
+
+DEFAULT_TEMPERATURE = 0.9
+MAX_TEMPERATURE = 2.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_TOP_K = 50
+DEFAULT_REPETITION_PENALTY = 1.1
+
+
+def validate_temperature(temperature: float) -> float:
+    if not math.isfinite(temperature) or not 0.0 < temperature <= MAX_TEMPERATURE:
+        raise ValueError(
+            f"temperature must be greater than 0 and at most {MAX_TEMPERATURE}."
+        )
+    return float(temperature)
+
+
+def validate_top_p(top_p: float) -> float:
+    if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be greater than 0 and at most 1.0.")
+    return float(top_p)
+
+
+def validate_top_k(top_k: int) -> int:
+    if top_k < 0:
+        raise ValueError("top_k must be zero or greater.")
+    return int(top_k)
+
+
+def validate_repetition_penalty(repetition_penalty: float) -> float:
+    if not math.isfinite(repetition_penalty) or repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be greater than 0.")
+    return float(repetition_penalty)
+
+
+def set_generation_sampling(
+    model: torch.nn.Module,
+    *,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+) -> None:
+    updates: dict[str, float | int] = {}
+    if temperature is not None:
+        updates["temperature"] = validate_temperature(temperature)
+    if top_p is not None:
+        updates["top_p"] = validate_top_p(top_p)
+    if top_k is not None:
+        updates["top_k"] = validate_top_k(top_k)
+    if not updates:
+        return
+    vars(model.generation_config).update(updates)
+    vars(model.depth_decoder.generation_config).update(updates)
+
+
+def set_generation_temperature(model: torch.nn.Module, temperature: float) -> None:
+    set_generation_sampling(model, temperature=temperature)
 
 
 def get_dist_info() -> tuple[int, int, int]:
@@ -43,14 +100,14 @@ def update_generation_config_for_breeze(
 ) -> None:
     generation_config = generation_config or {
         "depth_decoder_do_sample": True,
-        "depth_decoder_temperature": 0.9,
-        "depth_decoder_top_p": 1.0,
-        "depth_decoder_top_k": 50,
+        "depth_decoder_temperature": DEFAULT_TEMPERATURE,
+        "depth_decoder_top_p": DEFAULT_TOP_P,
+        "depth_decoder_top_k": DEFAULT_TOP_K,
         "do_sample": True,
-        "top_p": 1.0,
-        "top_k": 50,
+        "top_p": DEFAULT_TOP_P,
+        "top_k": DEFAULT_TOP_K,
         "max_new_tokens": 750,
-        "temperature": 0.9,
+        "temperature": DEFAULT_TEMPERATURE,
     }
 
     prefix = "depth_decoder_"

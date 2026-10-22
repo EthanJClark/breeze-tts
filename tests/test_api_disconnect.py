@@ -20,6 +20,12 @@ def inference(monkeypatch, tmp_path):
     class Runtime:
         sample_rate = 24000
 
+        def __init__(self):
+            self.limits = {}
+
+        def set_request_limits(self, **kwargs):
+            self.limits = kwargs
+
         def iter_audio_chunks(self, *args, **kwargs):
             def generate():
                 try:
@@ -35,8 +41,19 @@ def inference(monkeypatch, tmp_path):
     monkeypatch.setattr(api, "_request_lock", threading.Lock())
     monkeypatch.setattr(api, "set_all_seeds", lambda seed: None)
     monkeypatch.setattr(api, "prepare_inputs", lambda *args, **kwargs: {})
-    for name in ("tokenizer", "audio_tokenizer", "model"):
+    for name in ("tokenizer", "audio_tokenizer"):
         monkeypatch.setattr(api.app.state, name, None, raising=False)
+    monkeypatch.setattr(
+        api.app.state,
+        "model",
+        SimpleNamespace(
+            generation_config=SimpleNamespace(temperature=0.9),
+            depth_decoder=SimpleNamespace(
+                generation_config=SimpleNamespace(temperature=0.9)
+            ),
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(api.app.state, "runtime", Runtime(), raising=False)
 
     async def save(upload):
@@ -51,6 +68,11 @@ async def response():
         text="test",
         instruction=None,
         cfg_scale=1.0,
+        temperature=api.DEFAULT_TEMPERATURE,
+        top_p=api.DEFAULT_TOP_P,
+        top_k=api.DEFAULT_TOP_K,
+        repetition_penalty=api.DEFAULT_REPETITION_PENALTY,
+        max_new_tokens=api.MAX_NEW_TOKENS,
         ref_audio=SimpleNamespace(filename="reference.wav"),
         ref_text="reference",
         seed=42,

@@ -8,6 +8,8 @@
   <a href="https://x.com/BreezeBlueX"><img src="https://img.shields.io/badge/X-Follow%20BreezeBlue-000000?logo=x&logoColor=white" alt="X"></a>
 </div>
 
+> New here? See [GETTING_STARTED.md](GETTING_STARTED.md) for a short quick-start guide.
+
 > [!IMPORTANT]
 > Source code is licensed under Apache 2.0. Breeze TTS 2 model weights, derivative models, and self-hosted outputs are for research and non-commercial use only. See [License](#license-and-responsible-use).
 
@@ -164,11 +166,32 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM. Start the API with `--fast-all` to enable the fast path.
 
+Both speech endpoints accept `temperature` (default `0.9`, range `0 < temperature <= 2.0`). `/v1/audio/speech` also accepts `top_p` (default `1.0`), `top_k` (default `50`), `repetition_penalty` (default `1.1`), and `max_new_tokens` (default `1500`). Lower temperature is steadier; higher temperature and top-p are more varied. The CLI exposes temperature as `--temperature`.
+
 The model argument is either a local checkpoint directory or a Hugging Face repo id. Repo ids are downloaded into the standard Hugging Face cache; pass `--revision` to pin a branch, tag, or commit (ignored for local directories):
 
 ```bash
 python -m breeze_infer.api BreezeBlue/breeze-tts-2 --revision main --host 0.0.0.0 --port 7860
 ```
+
+### 🖥️ Web UI
+
+A Gradio interface is included. It talks to the streaming API, so start the API first and then run the UI in another terminal:
+
+```bash
+python -m breeze_infer.api ../breeze-tts-2 --host 0.0.0.0 --port 7860
+python webui.py --api-url http://127.0.0.1:7860
+```
+
+Open http://127.0.0.1:7861. The UI does not load the model, so it starts instantly and can point at a remote GPU server with `--api-url`.
+
+The interface has three tabs:
+
+- **Generate** — script, voice description, performance direction, instruction presets, delivery presets, saved reference voices, inline vocal-event buttons, multiple takes, and stop control. Voice design, cloning, and direction share this one form.
+- **Settings** — CFG scale, temperature, top-p, top-k, repetition penalty, max duration, takes, seed mode, request timeout, and autoplay. Save settings to persist them across restarts.
+- **Library** — manage instruction presets, reference voice profiles (audio plus exact transcript), and reusable scripts.
+
+State lives in `~/.local/share/breeze-tts/` and can be moved with `--data-dir` or `BREEZE_DATA_DIR`. `--presets-file` overrides just the instruction presets file. Saved voices keep their audio under `references/`.
 
 ### 📦 Batch API
 

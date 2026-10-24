@@ -10,6 +10,7 @@ HTTP API, which can be local or remote:
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import secrets
 import time
@@ -20,48 +21,19 @@ import gradio as gr
 import httpx
 import numpy as np
 
-from webui_store import DEFAULT_DATA_DIR, DEFAULT_SETTINGS, Store
+from webui_store import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_SETTINGS,
+    VOICE_CLONE,
+    VOICE_DESCRIBE,
+    Store,
+)
 
 DEFAULT_API_URL = "http://127.0.0.1:7860"
 DEFAULT_SAMPLE_RATE = 24000
 FALLBACK_FRAME_RATE = 12.5
 MAX_NEW_TOKENS = 1500
 DEFAULT_TIMEOUT = 600.0
-
-DELIVERY_PRESETS = {
-    "Warm": (
-        "Warm, friendly, and reassuring. A gentle smile is audible, the pace is "
-        "relaxed, and the delivery feels personal and kind."
-    ),
-    "Amused": (
-        "Amused and playful. The voice lifts with a chuckle, the timing is light, "
-        "and a smile runs through the lines."
-    ),
-    "Tender": (
-        "Tender and intimate. Soft volume, slow pace, gentle breath, and long "
-        "pauses before the most important words."
-    ),
-    "Excited": (
-        "Excited and energetic. Brighter pitch, quicker pace, rising momentum, "
-        "and genuine enthusiasm."
-    ),
-    "Melancholy": (
-        "Melancholy and reflective. Lower volume, slower pace, downward phrasing, "
-        "and quiet pauses that carry the weight of the words."
-    ),
-    "Menacing": (
-        "Cold and menacing. Low, controlled, deliberate delivery with long pauses "
-        "and a threat held just beneath the surface."
-    ),
-    "Conspiratorial": (
-        "Conspiratorial and close. A near-whisper, leaning toward the listener, "
-        "with amused pauses and a sense of shared secrets."
-    ),
-    "Urgent": (
-        "Urgent and focused. Faster pace, clipped phrasing, tight breath, and "
-        "forward momentum."
-    ),
-}
 
 EVENT_TAGS = [
     "(laugh)",
@@ -89,16 +61,39 @@ def _error_detail(response: httpx.Response) -> str:
     return str(detail or response.text).strip() or f"HTTP {response.status_code}"
 
 
-def _instruction(voice: str, performance: str) -> str:
-    parts = []
-    if voice.strip():
-        parts.append(f"Voice: {voice.strip()}")
-    if performance.strip():
-        parts.append(f"Performance: {performance.strip()}")
-    return "\n\n".join(parts)
+def _resolve_voice_inputs(
+    voice: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
+) -> tuple[str, bytes | None, str | None, str]:
+    """Return (instruction, reference audio, filename, transcript).
+
+    Raises GenerationError with a user-facing message.
+    """
+    voice = (voice or VOICE_DESCRIBE).strip()
+
+    if voice != VOICE_CLONE:
+        return (description or "").strip(), None, None, ""
+
+    instruction = (delivery or "").strip()
+    path = Path(reference_audio) if reference_audio else None
+    transcript = (reference_text or "").strip()
+    if path is None:
+        raise GenerationError(
+            "Upload or record a reference clip, or choose Describe a voice."
+        )
+    if not transcript:
+        raise GenerationError("The reference clip needs its exact transcript.")
+    try:
+        return instruction, path.read_bytes(), path.name, transcript
+    except OSError as exc:
+        raise GenerationError(f"Cannot read reference audio: {exc}") from exc
 
 
 def _summary(
+    mode: str,
     cfg_scale: float,
     temperature: float,
     top_p: float,
@@ -111,9 +106,10 @@ def _summary(
 ) -> str:
     seed_text = f"seed {seed}" if seed_mode == "fixed" else "random seed"
     return (
-        f"CFG {cfg_scale:g} · temp {temperature:.2f} · top-p {top_p:.2f} · "
-        f"top-k {top_k} · rep {repetition_penalty:.2f} · max {max_duration:g}s · "
-        f"{seed_text} · {takes} take{'s' if takes != 1 else ''}"
+        f"Current settings · {mode} · CFG {cfg_scale:g} · temp {temperature:.2f} · "
+        f"top-p {top_p:.2f} · top-k {top_k} · rep {repetition_penalty:.2f} · "
+        f"max {max_duration:g}s · {seed_text} · "
+        f"{takes} take{'s' if takes != 1 else ''}"
     )
 
 
@@ -218,10 +214,10 @@ def _generation_outputs(
 def run_generation(
     text: str,
     voice: str,
-    performance: str,
-    reference_profile: str | None,
+    description: str,
     reference_audio: str | None,
     reference_text: str,
+    delivery: str,
     cfg_scale: float,
     temperature: float,
     top_p: float,
@@ -233,82 +229,34 @@ def run_generation(
     seed: float,
     timeout: float,
     *,
-    store: Store,
     api_url: str,
     frame_rate: float,
 ):
     text = (text or "").strip()
-    voice = (voice or "").strip()
-    performance = (performance or "").strip()
-    one_off_audio = reference_audio or None
-    one_off_text = (reference_text or "").strip()
 
     if not text:
         yield _generation_outputs(
             None, [], [], "❌ Enter some text to speak.", "", busy=False
         )
         return
-    if one_off_audio and not one_off_text:
-        yield _generation_outputs(
-            None,
-            [],
-            [],
-            "❌ The one-off reference audio needs its exact transcript.",
-            "",
-            busy=False,
+
+    try:
+        instruction, reference_bytes, reference_filename, resolved_ref_text = (
+            _resolve_voice_inputs(
+                voice,
+                description,
+                reference_audio,
+                reference_text,
+                delivery,
+            )
         )
-        return
-    if one_off_text and not one_off_audio and not reference_profile:
-        yield _generation_outputs(
-            None,
-            [],
-            [],
-            "❌ The one-off reference transcript needs an audio clip.",
-            "",
-            busy=False,
-        )
+    except GenerationError as exc:
+        yield _generation_outputs(None, [], [], f"❌ {exc}", "", busy=False)
         return
 
-    instruction = _instruction(voice, performance)
     has_instruction = bool(instruction)
     effective_cfg = float(cfg_scale) if has_instruction else 1.0
-
-    reference_bytes = None
-    reference_filename = None
-    resolved_ref_text = ""
-    if one_off_audio:
-        try:
-            reference_bytes = Path(one_off_audio).read_bytes()
-        except OSError as exc:
-            yield _generation_outputs(
-                None, [], [], f"❌ Cannot read reference audio: {exc}", "", busy=False
-            )
-            return
-        reference_filename = Path(one_off_audio).name
-        resolved_ref_text = one_off_text
-    elif reference_profile:
-        voices, _ = store.load_voices()
-        profile = voices.get(reference_profile)
-        if profile is None:
-            yield _generation_outputs(
-                None,
-                [],
-                [],
-                f"❌ Saved voice **{reference_profile}** was not found.",
-                "",
-                busy=False,
-            )
-            return
-        try:
-            path = store.reference_path(profile)
-            reference_bytes = path.read_bytes()
-        except (OSError, ValueError) as exc:
-            yield _generation_outputs(
-                None, [], [], f"❌ Cannot read saved voice: {exc}", "", busy=False
-            )
-            return
-        reference_filename = path.name
-        resolved_ref_text = profile["ref_text"]
+    mode = _mode(reference_bytes is not None, has_instruction)
 
     try:
         take_count = max(1, min(4, int(takes)))
@@ -328,6 +276,7 @@ def run_generation(
         seeds = [(seed_value + index) % (2**31) for index in range(take_count)]
 
     summary = _summary(
+        mode,
         effective_cfg,
         float(temperature),
         float(top_p),
@@ -438,220 +387,276 @@ def select_take(label: str | None, results: list[dict] | None):
     return None, "❌ That take is no longer available."
 
 
-def append_event(text: str, tag: str) -> str:
-    text = (text or "").rstrip()
-    return f"{text} {tag}".strip()
-
-
-def apply_delivery(name: str | None) -> str:
-    if not name or name == "None":
-        return ""
-    return DELIVERY_PRESETS.get(name, "")
-
-
-def apply_script(name: str | None, *, store: Store) -> str:
-    if not name:
-        return ""
-    scripts, _ = store.load_scripts()
-    return scripts.get(name, "")
-
-
-def apply_instruction_preset(name: str | None, *, store: Store):
-    if not name:
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-    presets, _ = store.load_presets()
-    preset = presets.get(name)
-    if preset is None:
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+def _voice_ui(selection: str | None):
+    """Visibility updates for the voice-specific fields."""
+    if (selection or VOICE_DESCRIBE).strip() == VOICE_CLONE:
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=True),
+        )
     return (
-        preset["voice"],
-        preset["performance"],
-        preset["cfg_scale"],
-        preset["temperature"],
-        preset["seed"],
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
     )
 
 
-def load_preset_editor(name: str | None, *, store: Store):
-    if not name:
-        return "", "", "", 4.0, 0.9, 42
-    presets, _ = store.load_presets()
-    preset = presets.get(name)
-    if preset is None:
-        return name, "", "", 4.0, 0.9, 42
-    return (
-        name,
-        preset["voice"],
-        preset["performance"],
-        preset["cfg_scale"],
-        preset["temperature"],
-        preset["seed"],
-    )
+def on_voice_change(selection: str | None):
+    return _voice_ui(selection)
 
 
-def save_instruction_preset(
+def collect_preset_state(
     name: str,
     voice: str,
-    performance: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
     cfg_scale: float,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_duration: float,
+    takes: float,
+    seed_mode: str,
     seed: float,
+    timeout: float,
+    autoplay: bool,
+) -> dict:
+    name = (name or "").strip()
+    if not name:
+        raise GenerationError("Enter a preset name.")
+
+    voice = (voice or VOICE_DESCRIBE).strip()
+    description = (description or "").strip()
+    delivery = (delivery or "").strip()
+    reference = None
+
+    if voice == VOICE_CLONE:
+        audio = reference_audio or None
+        ref_text = (reference_text or "").strip()
+        if audio and not ref_text:
+            raise GenerationError(
+                "The reference clip needs its exact transcript before saving."
+            )
+        if ref_text and not audio:
+            raise GenerationError("The reference transcript needs an audio clip.")
+        if audio:
+            try:
+                data = Path(audio).read_bytes()
+            except OSError as exc:
+                raise GenerationError(f"Cannot read reference audio: {exc}") from exc
+            reference = {
+                "filename": Path(audio).name,
+                "text": ref_text,
+                "audio_b64": base64.b64encode(data).decode("ascii"),
+            }
+    else:
+        voice = VOICE_DESCRIBE
+
+    if not description and not delivery and reference is None:
+        raise GenerationError(
+            "Add a voice description or a reference clip before saving."
+        )
+
+    return {
+        "voice_source": voice,
+        "description": description,
+        "delivery": delivery,
+        "reference": reference,
+        "settings": {
+            "cfg_scale": cfg_scale,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+            "max_duration": max_duration,
+            "takes": takes,
+            "seed_mode": seed_mode,
+            "seed": seed,
+            "timeout": timeout,
+            "autoplay": autoplay,
+        },
+    }
+
+
+def apply_preset_state(name: str, preset: dict, *, store: Store):
+    """Return component updates in the order used by the preset wiring."""
+    voice = str(preset.get("voice_source") or VOICE_DESCRIBE).strip()
+    reference = preset.get("reference") or {}
+    audio_path = None
+    ref_text = ""
+    message = f"✅ Loaded preset **{name}**."
+
+    if voice not in (VOICE_DESCRIBE, VOICE_CLONE):
+        # Older presets may name a saved voice. The bundled clip replaces it.
+        if reference.get("audio_b64"):
+            voice = VOICE_CLONE
+            message = (
+                f"⚠️ Saved voice **{preset.get('voice_source')}** was replaced "
+                "by the preset's bundled clip."
+            )
+        else:
+            voice = VOICE_DESCRIBE
+            message = (
+                f"⚠️ Saved voice **{preset.get('voice_source')}** is unavailable "
+                "and the preset has no bundled clip."
+            )
+
+    if voice == VOICE_CLONE and reference.get("audio_b64"):
+        path = store.materialize_reference(name, preset)
+        if path is not None:
+            audio_path = str(path)
+            ref_text = str(reference.get("text") or "")
+
+    settings = preset.get("settings") or {}
+    defaults = DEFAULT_SETTINGS
+
+    def value(key):
+        return settings.get(key, defaults[key])
+
+    updates = (
+        gr.update(value=name),
+        gr.update(value=voice),
+        str(preset.get("description") or ""),
+        audio_path,
+        ref_text,
+        str(preset.get("delivery") or ""),
+        value("cfg_scale"),
+        value("temperature"),
+        value("top_p"),
+        value("top_k"),
+        value("repetition_penalty"),
+        value("max_duration"),
+        value("takes"),
+        value("seed_mode"),
+        value("seed"),
+        value("timeout"),
+        bool(value("autoplay")),
+        *_voice_ui(voice),
+    )
+    return updates, message
+
+
+def apply_preset_handler(name: str | None, *, store: Store):
+    preset = store.load_preset(name)
+    if preset is None:
+        return (
+            *(gr.update() for _ in range(20)),
+            "❌ Select a preset to load.",
+        )
+    updates, message = apply_preset_state(name, preset, store=store)
+    return (*updates, message)
+
+
+def save_preset_handler(
+    name: str,
+    voice: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_duration: float,
+    takes: float,
+    seed_mode: str,
+    seed: float,
+    timeout: float,
+    autoplay: bool,
     *,
     store: Store,
 ):
-    name = (name or "").strip()
-    voice = (voice or "").strip()
-    performance = (performance or "").strip()
-    if not name:
-        return gr.update(), gr.update(), "❌ Enter a preset name."
-    if not voice and not performance:
-        return gr.update(), gr.update(), "❌ Enter a voice or performance description."
-    presets, _ = store.load_presets()
-    existed = name in presets
-    presets[name] = {
-        "voice": voice,
-        "performance": performance,
-        "cfg_scale": float(cfg_scale),
-        "temperature": float(temperature),
-        "seed": int(seed),
-    }
     try:
-        store.save_presets(presets)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not save: {exc}"
-    choices = sorted(presets)
-    update = gr.update(choices=choices, value=name)
-    action = "Updated" if existed else "Saved"
-    return update, update, f"✅ {action} **{name}**."
+        payload = collect_preset_state(
+            name,
+            voice,
+            description,
+            reference_audio,
+            reference_text,
+            delivery,
+            cfg_scale,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            max_duration,
+            takes,
+            seed_mode,
+            seed,
+            timeout,
+            autoplay,
+        )
+        stored = store.save_preset(name, payload)
+    except (GenerationError, ValueError, OSError) as exc:
+        return gr.update(), gr.update(), f"❌ {exc}"
+
+    presets, _ = store.list_presets()
+    return (
+        gr.update(choices=sorted(presets), value=stored),
+        gr.update(value=stored),
+        f"✅ Saved preset **{stored}**.",
+    )
 
 
-def delete_instruction_preset(name: str | None, *, store: Store):
+def delete_preset_handler(name: str | None, *, store: Store):
     if not name:
         return gr.update(), gr.update(), "❌ Select a preset to delete."
-    presets, _ = store.load_presets()
-    if name not in presets:
-        return gr.update(choices=sorted(presets)), gr.update(), "❌ Preset not found."
-    del presets[name]
     try:
-        store.save_presets(presets)
+        deleted = store.delete_preset(name)
     except OSError as exc:
         return gr.update(), gr.update(), f"❌ Could not delete: {exc}"
-    choices = sorted(presets)
-    update = gr.update(choices=choices, value=None)
-    return update, update, f"✅ Deleted **{name}**."
+    if not deleted:
+        return gr.update(), gr.update(), "❌ Preset not found."
+    presets, _ = store.list_presets()
+    return (
+        gr.update(choices=sorted(presets), value=None),
+        gr.update(value=""),
+        f"✅ Deleted preset **{name}**.",
+    )
 
 
-def load_script_editor(name: str | None, *, store: Store):
+def export_preset_handler(name: str | None, *, store: Store):
     if not name:
-        return "", ""
-    scripts, _ = store.load_scripts()
-    return name, scripts.get(name, "")
-
-
-def save_script(name: str, text: str, *, store: Store):
-    name = (name or "").strip()
-    text = (text or "").strip()
-    if not name:
-        return gr.update(), gr.update(), "❌ Enter a script name."
-    if not text:
-        return gr.update(), gr.update(), "❌ Enter script text."
-    scripts, _ = store.load_scripts()
-    existed = name in scripts
-    scripts[name] = text
+        return gr.update(), "❌ Select a preset to export."
     try:
-        store.save_scripts(scripts)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not save: {exc}"
-    choices = sorted(scripts)
-    update = gr.update(choices=choices, value=name)
-    action = "Updated" if existed else "Saved"
-    return update, update, f"✅ {action} **{name}**."
+        path = store.export_preset(name)
+    except (OSError, ValueError) as exc:
+        return gr.update(), f"❌ {exc}"
+    return (
+        gr.update(value=str(path), interactive=True),
+        f"✅ Exported **{name}**. Use Download.",
+    )
 
 
-def delete_script(name: str | None, *, store: Store):
-    if not name:
-        return gr.update(), gr.update(), "❌ Select a script to delete."
-    scripts, _ = store.load_scripts()
-    if name not in scripts:
-        return gr.update(choices=sorted(scripts)), gr.update(), "❌ Script not found."
-    del scripts[name]
+def import_preset_handler(file_path: str | None, *, store: Store):
+    if not file_path:
+        return (*(gr.update() for _ in range(22)), "❌ Choose a JSON file.")
     try:
-        store.save_scripts(scripts)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not delete: {exc}"
-    choices = sorted(scripts)
-    update = gr.update(choices=choices, value=None)
-    return update, update, f"✅ Deleted **{name}**."
+        raw = Path(file_path).read_bytes()
+        name = store.import_preset(raw, Path(file_path).name)
+    except (OSError, ValueError) as exc:
+        return (*(gr.update() for _ in range(22)), f"❌ {exc}")
 
-
-def load_voice_editor(name: str | None, *, store: Store):
-    if not name:
-        return "", None, ""
-    voices, _ = store.load_voices()
-    profile = voices.get(name)
-    if profile is None:
-        return name, None, ""
-    try:
-        path = store.reference_path(profile)
-    except ValueError:
-        return name, None, profile["ref_text"]
-    return name, str(path), profile["ref_text"]
-
-
-def save_voice_profile(
-    name: str,
-    audio: str | None,
-    ref_text: str,
-    *,
-    store: Store,
-):
-    name = (name or "").strip()
-    ref_text = (ref_text or "").strip()
-    if not name:
-        return gr.update(), gr.update(), "❌ Enter a voice name."
-    if not audio:
-        return gr.update(), gr.update(), "❌ Upload reference audio."
-    if not ref_text:
-        return gr.update(), gr.update(), "❌ Enter the exact transcript."
-    voices, _ = store.load_voices()
-    old = voices.get(name)
-    try:
-        relative = store.import_reference(name, audio)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not copy reference audio: {exc}"
-    existed = name in voices
-    voices[name] = {"audio": relative, "ref_text": ref_text}
-    try:
-        store.save_voices(voices)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not save voice: {exc}"
-    if old and old.get("audio") != relative:
-        store.remove_reference(old)
-    choices = sorted(voices)
-    update = gr.update(choices=choices, value=name)
-    action = "Updated" if existed else "Saved"
-    return update, update, f"✅ {action} voice **{name}**."
-
-
-def delete_voice_profile(name: str | None, *, store: Store):
-    if not name:
-        return gr.update(), gr.update(), "❌ Select a voice to delete."
-    voices, _ = store.load_voices()
-    if name not in voices:
-        return gr.update(choices=sorted(voices)), gr.update(), "❌ Voice not found."
-    profile = voices.pop(name)
-    try:
-        store.save_voices(voices)
-    except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not delete: {exc}"
-    store.remove_reference(profile)
-    choices = sorted(voices)
-    update = gr.update(choices=choices, value=None)
-    return update, update, f"✅ Deleted voice **{name}**."
-
-
-def reference_summary(name: str | None) -> str:
-    return f"Using saved voice **{name}**." if name else ""
+    presets, _ = store.list_presets()
+    preset = presets.get(name)
+    if preset is None:
+        return (
+            *(gr.update() for _ in range(22)),
+            "❌ Imported preset could not be read.",
+        )
+    updates, message = apply_preset_state(name, preset, store=store)
+    return (
+        gr.update(choices=sorted(presets), value=name),
+        gr.update(value=None),
+        *updates,
+        message,
+    )
 
 
 def save_settings_handler(
@@ -710,14 +715,11 @@ def reset_settings_handler(*, store: Store):
 
 def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
     settings, settings_warning = store.load_settings()
-    presets, presets_warning = store.load_presets()
-    scripts, scripts_warning = store.load_scripts()
-    voices, voices_warning = store.load_voices()
+    presets, presets_warning = store.list_presets()
 
     preset_choices = sorted(presets)
-    script_choices = sorted(scripts)
-    voice_choices = sorted(voices)
     initial_summary = _summary(
+        "Voice design",
         settings["cfg_scale"],
         settings["temperature"],
         settings["top_p"],
@@ -728,93 +730,134 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
         settings["seed_mode"],
         settings["seed"],
     )
+    event_guide = ", ".join(f"`{tag}`" for tag in EVENT_TAGS[:-1])
+    event_guide = f"{event_guide}, or `{EVENT_TAGS[-1]}`"
 
     with gr.Blocks(title="Breeze TTS 2") as demo:
-        gr.Markdown(
-            "# Breeze TTS 2\n"
-            "Generate speech with voice design, cloning, or direction. "
-            "The API runs separately; this page only sends requests."
-        )
+        gr.Markdown("# Breeze TTS 2\nType a script, choose a voice, then generate.")
 
         with gr.Tabs():
             with gr.Tab("Generate"):  # noqa: SIM117
                 with gr.Row():
                     with gr.Column(scale=3):
+                        gr.Markdown("### 1 · Script")
                         text = gr.Textbox(
                             label="Script",
+                            show_label=False,
                             placeholder="Type the text to synthesize...",
                             lines=7,
                             autofocus=True,
                         )
-                        with gr.Row():
-                            event_buttons = [
-                                gr.Button(tag, size="sm", variant="secondary")
-                                for tag in EVENT_TAGS
-                            ]
-                        script_preset = gr.Dropdown(
-                            label="Script preset",
-                            choices=script_choices,
-                            value=None,
-                            filterable=True,
-                        )
-                        voice = gr.Textbox(
+
+                        gr.Markdown("### 2 · Voice")
+                        voice_source = gr.Dropdown(
                             label="Voice",
-                            placeholder=(
-                                "Age, timbre, accent, texture. E.g. a weathered "
-                                "baritone in his early sixties."
-                            ),
-                            lines=3,
+                            show_label=False,
+                            choices=[VOICE_DESCRIBE, VOICE_CLONE],
+                            value=VOICE_DESCRIBE,
+                            filterable=False,
                         )
-                        performance = gr.Textbox(
-                            label="Performance",
-                            placeholder=(
-                                "Emotion, pace, dynamics. E.g. delighted and a little "
-                                "mischievous, leaning in for the secret."
-                            ),
-                            lines=3,
+                        gr.Markdown(
+                            "Describe a voice in words, or clone one from a clip."
                         )
-                        with gr.Row():
-                            instruction_preset = gr.Dropdown(
-                                label="Instruction preset",
-                                choices=preset_choices,
-                                value=None,
-                                filterable=True,
+
+                        with gr.Column(visible=True) as describe_group:
+                            description = gr.Textbox(
+                                label="Voice & delivery",
+                                placeholder=(
+                                    "Age, timbre, accent, and delivery. E.g. a weathered "
+                                    "baritone in his early sixties, warm and a little "
+                                    "mischievous. Speaks slowly, leaning in for the secret."
+                                ),
+                                lines=5,
                             )
-                            delivery_preset = gr.Dropdown(
-                                label="Delivery preset",
-                                choices=["None"] + list(DELIVERY_PRESETS),
-                                value="None",
-                            )
-                        with gr.Accordion("Reference voice (optional)", open=False):
-                            gr.Markdown(
-                                "A one-off clip takes precedence over a saved voice. "
-                                "Provide the exact transcript for whichever clip you use."
-                            )
-                            reference_profile = gr.Dropdown(
-                                label="Saved voice",
-                                choices=voice_choices,
-                                value=None,
-                                filterable=True,
-                            )
-                            reference_info = gr.Markdown("")
+
+                        with gr.Column(visible=False) as clone_group:
                             reference_audio = gr.Audio(
-                                label="One-off reference audio",
+                                label="Reference clip",
                                 sources=["upload", "microphone"],
                                 type="filepath",
                             )
                             reference_text = gr.Textbox(
-                                label="Exact transcript of the one-off reference",
+                                label="Exact transcript of the clip",
                                 placeholder="Every word spoken in the clip.",
                                 lines=3,
                             )
 
+                        with gr.Column(visible=False) as delivery_group:
+                            delivery = gr.Textbox(
+                                label="Delivery direction (optional)",
+                                placeholder=(
+                                    "Emotion, pace, dynamics. E.g. delighted and a little "
+                                    "mischievous, leaning in for the secret."
+                                ),
+                                lines=3,
+                            )
+
+                        gr.Markdown("### Presets")
+                        with gr.Row():
+                            preset_dropdown = gr.Dropdown(
+                                label="Preset",
+                                choices=preset_choices,
+                                value=None,
+                                filterable=True,
+                                scale=2,
+                            )
+                            preset_name = gr.Textbox(
+                                label="Preset name",
+                                placeholder="Name this preset...",
+                                scale=1,
+                            )
+                        with gr.Row():
+                            save_preset_button = gr.Button(
+                                "Save preset",
+                                variant="primary",
+                                size="sm",
+                                scale=0,
+                                min_width=110,
+                            )
+                            delete_preset_button = gr.Button(
+                                "Delete", size="sm", scale=0, min_width=80
+                            )
+                            import_preset_button = gr.UploadButton(
+                                "Import JSON",
+                                file_types=[".json"],
+                                size="sm",
+                                scale=0,
+                                min_width=110,
+                            )
+                            export_preset_button = gr.Button(
+                                "Export", size="sm", scale=0, min_width=80
+                            )
+                            download_preset = gr.DownloadButton(
+                                "Download JSON",
+                                size="sm",
+                                scale=0,
+                                min_width=130,
+                                interactive=False,
+                            )
+                        preset_status = gr.Markdown(
+                            presets_warning
+                            or "Presets keep the voice, clip, and settings. The script is not included."
+                        )
+
                     with gr.Column(scale=2):
+                        gr.Markdown("### 3 · Generate")
                         with gr.Row():
                             generate_button = gr.Button(
-                                "Generate", variant="primary", scale=2
+                                "Generate",
+                                variant="primary",
+                                size="md",
+                                scale=0,
+                                min_width=160,
                             )
                             stop_button = gr.Button(
-                                "Stop", variant="stop", interactive=False
+                                "Stop",
+                                variant="stop",
+                                size="sm",
+                                scale=0,
+                                min_width=90,
+                                interactive=False,
                             )
                         output_audio = gr.Audio(
                             label="Generated audio",
@@ -831,13 +874,12 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                         takes_state = gr.State([])
                         with gr.Accordion("Tips", open=False):
                             gr.Markdown(
-                                "**Voice design** — fill Voice and/or Performance, "
-                                "leave the reference section empty.\n\n"
-                                "**Voice clone** — add a reference clip and transcript, "
-                                "leave Performance empty.\n\n"
-                                "**Voice direction** — add a reference plus Performance.\n\n"
-                                "**Vocal events** — use `(laugh)`, `(sigh)`, `(cough)`, "
-                                "or `(clears throat)` in the script.\n\n"
+                                f"**Vocal events** — type {event_guide} anywhere "
+                                "in the script.\n\n"
+                                "**Voice** — Describe types a voice in words; Clone "
+                                "uses a clip plus its exact transcript.\n\n"
+                                "**Presets** — Save preset stores the voice, reference "
+                                "clip, and sampling settings, but not the script.\n\n"
                                 f"API: `{api_url}`"
                             )
 
@@ -919,107 +961,111 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                         )
                         with gr.Row():
                             save_settings_button = gr.Button(
-                                "Save settings", variant="primary"
+                                "Save settings",
+                                variant="primary",
+                                size="sm",
+                                scale=0,
+                                min_width=110,
                             )
-                            reset_settings_button = gr.Button("Reset defaults")
+                            reset_settings_button = gr.Button(
+                                "Reset defaults", size="sm", scale=0, min_width=110
+                            )
                         settings_status = gr.Markdown(
                             settings_warning
                             or "Values apply immediately. Save to persist across restarts."
                         )
 
-            with gr.Tab("Library"):  # noqa: SIM117
-                with gr.Tabs():
-                    with gr.Tab("Instructions"):
-                        with gr.Row():
-                            preset_selector = gr.Dropdown(
-                                label="Saved instructions",
-                                choices=preset_choices,
-                                value=None,
-                                filterable=True,
-                            )
-                            preset_name = gr.Textbox(
-                                label="Name", placeholder="Name this instruction..."
-                            )
-                        preset_voice = gr.Textbox(label="Voice", lines=3)
-                        preset_performance = gr.Textbox(label="Performance", lines=3)
-                        with gr.Row():
-                            preset_cfg = gr.Slider(
-                                1.0, 6.0, 4.0, step=0.5, label="CFG scale"
-                            )
-                            preset_temperature = gr.Slider(
-                                0.5, 1.5, 0.9, step=0.05, label="Temperature"
-                            )
-                            preset_seed = gr.Number(value=42, precision=0, label="Seed")
-                        with gr.Row():
-                            save_preset_button = gr.Button(
-                                "Save instruction", variant="primary"
-                            )
-                            delete_preset_button = gr.Button("Delete")
-                        preset_status = gr.Markdown(
-                            presets_warning
-                            or "Save voice/performance combinations with their sampling settings."
-                        )
+        preset_state_outputs = [
+            preset_name,
+            voice_source,
+            description,
+            reference_audio,
+            reference_text,
+            delivery,
+            cfg_scale,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            max_duration,
+            takes,
+            seed_mode,
+            seed,
+            timeout,
+            autoplay,
+            describe_group,
+            clone_group,
+            delivery_group,
+        ]
 
-                    with gr.Tab("Voices"):
-                        with gr.Row():
-                            voice_selector = gr.Dropdown(
-                                label="Saved voices",
-                                choices=voice_choices,
-                                value=None,
-                                filterable=True,
-                            )
-                            voice_name = gr.Textbox(
-                                label="Name", placeholder="Name this voice..."
-                            )
-                        voice_audio = gr.Audio(
-                            label="Reference audio",
-                            sources=["upload", "microphone"],
-                            type="filepath",
-                        )
-                        voice_text = gr.Textbox(
-                            label="Exact transcript",
-                            placeholder="Every word spoken in the reference clip.",
-                            lines=3,
-                        )
-                        with gr.Row():
-                            save_voice_button = gr.Button(
-                                "Save voice", variant="primary"
-                            )
-                            delete_voice_button = gr.Button("Delete")
-                        voice_status = gr.Markdown(
-                            voices_warning
-                            or "Saved voices keep the audio and transcript for reuse."
-                        )
+        preset_dropdown.input(
+            partial(apply_preset_handler, store=store),
+            inputs=preset_dropdown,
+            outputs=[*preset_state_outputs, preset_status],
+            api_name="apply_preset",
+        )
+        save_preset_button.click(
+            partial(save_preset_handler, store=store),
+            inputs=[
+                preset_name,
+                voice_source,
+                description,
+                reference_audio,
+                reference_text,
+                delivery,
+                cfg_scale,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                max_duration,
+                takes,
+                seed_mode,
+                seed,
+                timeout,
+                autoplay,
+            ],
+            outputs=[preset_dropdown, preset_name, preset_status],
+            api_name="save_preset",
+        )
+        delete_preset_button.click(
+            partial(delete_preset_handler, store=store),
+            inputs=preset_dropdown,
+            outputs=[preset_dropdown, preset_name, preset_status],
+            api_name="delete_preset",
+        )
+        export_preset_button.click(
+            partial(export_preset_handler, store=store),
+            inputs=preset_dropdown,
+            outputs=[download_preset, preset_status],
+            api_name="export_preset",
+        )
+        import_preset_button.upload(
+            partial(import_preset_handler, store=store),
+            inputs=import_preset_button,
+            outputs=[
+                preset_dropdown,
+                import_preset_button,
+                *preset_state_outputs,
+                preset_status,
+            ],
+            api_name="import_preset",
+        )
 
-                    with gr.Tab("Scripts"):
-                        with gr.Row():
-                            script_selector = gr.Dropdown(
-                                label="Saved scripts",
-                                choices=script_choices,
-                                value=None,
-                                filterable=True,
-                            )
-                            script_name = gr.Textbox(
-                                label="Name", placeholder="Name this script..."
-                            )
-                        script_text = gr.Textbox(label="Script", lines=8)
-                        with gr.Row():
-                            save_script_button = gr.Button(
-                                "Save script", variant="primary"
-                            )
-                            delete_script_button = gr.Button("Delete")
-                        script_status = gr.Markdown(
-                            scripts_warning
-                            or "Saved scripts can be loaded on the Generate tab."
-                        )
+        voice_source.input(
+            on_voice_change,
+            inputs=voice_source,
+            outputs=[describe_group, clone_group, delivery_group],
+            api_name="change_voice_source",
+        )
 
         event_inputs = [
             text,
-            voice,
-            performance,
-            reference_profile,
+            voice_source,
+            description,
             reference_audio,
             reference_text,
+            delivery,
             cfg_scale,
             temperature,
             top_p,
@@ -1035,7 +1081,6 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
         generate_event = generate_button.click(
             partial(
                 run_generation,
-                store=store,
                 api_url=api_url,
                 frame_rate=frame_rate,
             ),
@@ -1064,31 +1109,6 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             outputs=[output_audio, status],
             api_name="select_take",
         )
-        script_preset.input(
-            partial(apply_script, store=store),
-            inputs=script_preset,
-            outputs=text,
-            api_name="apply_script",
-        )
-        instruction_preset.input(
-            partial(apply_instruction_preset, store=store),
-            inputs=instruction_preset,
-            outputs=[voice, performance, cfg_scale, temperature, seed],
-            api_name="apply_instruction_preset",
-        )
-        delivery_preset.input(
-            apply_delivery,
-            inputs=delivery_preset,
-            outputs=performance,
-            api_name="apply_delivery",
-        )
-        for index, (button, tag) in enumerate(zip(event_buttons, EVENT_TAGS)):
-            button.click(
-                partial(append_event, tag=tag),
-                inputs=text,
-                outputs=text,
-                api_name=f"insert_event_{index}",
-            )
 
         autoplay.change(
             lambda enabled: gr.update(autoplay=bool(enabled)),
@@ -1133,83 +1153,6 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             api_name="reset_settings",
         )
 
-        preset_selector.input(
-            partial(load_preset_editor, store=store),
-            inputs=preset_selector,
-            outputs=[
-                preset_name,
-                preset_voice,
-                preset_performance,
-                preset_cfg,
-                preset_temperature,
-                preset_seed,
-            ],
-            api_name="load_preset",
-        )
-        save_preset_button.click(
-            partial(save_instruction_preset, store=store),
-            inputs=[
-                preset_name,
-                preset_voice,
-                preset_performance,
-                preset_cfg,
-                preset_temperature,
-                preset_seed,
-            ],
-            outputs=[preset_selector, instruction_preset, preset_status],
-            api_name="save_preset",
-        )
-        delete_preset_button.click(
-            partial(delete_instruction_preset, store=store),
-            inputs=preset_selector,
-            outputs=[preset_selector, instruction_preset, preset_status],
-            api_name="delete_preset",
-        )
-
-        voice_selector.input(
-            partial(load_voice_editor, store=store),
-            inputs=voice_selector,
-            outputs=[voice_name, voice_audio, voice_text],
-            api_name="load_voice",
-        )
-        save_voice_button.click(
-            partial(save_voice_profile, store=store),
-            inputs=[voice_name, voice_audio, voice_text],
-            outputs=[voice_selector, reference_profile, voice_status],
-            api_name="save_voice",
-        )
-        delete_voice_button.click(
-            partial(delete_voice_profile, store=store),
-            inputs=voice_selector,
-            outputs=[voice_selector, reference_profile, voice_status],
-            api_name="delete_voice",
-        )
-        reference_profile.input(
-            reference_summary,
-            inputs=reference_profile,
-            outputs=reference_info,
-            api_name="reference_summary",
-        )
-
-        script_selector.input(
-            partial(load_script_editor, store=store),
-            inputs=script_selector,
-            outputs=[script_name, script_text],
-            api_name="load_script",
-        )
-        save_script_button.click(
-            partial(save_script, store=store),
-            inputs=[script_name, script_text],
-            outputs=[script_selector, script_preset, script_status],
-            api_name="save_script",
-        )
-        delete_script_button.click(
-            partial(delete_script, store=store),
-            inputs=script_selector,
-            outputs=[script_selector, script_preset, script_status],
-            api_name="delete_script",
-        )
-
     return demo.queue(default_concurrency_limit=1)
 
 
@@ -1226,17 +1169,7 @@ def main() -> None:
         "--data-dir",
         type=Path,
         default=DEFAULT_DATA_DIR,
-        help="Directory for settings, presets, scripts, and voices (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--presets-file",
-        type=Path,
-        default=(
-            Path(os.environ["BREEZE_PRESETS_FILE"]).expanduser()
-            if os.environ.get("BREEZE_PRESETS_FILE")
-            else None
-        ),
-        help="Override just the instruction presets file",
+        help="Directory for settings, presets, and saved voices (default: %(default)s)",
     )
     parser.add_argument(
         "--share", action="store_true", help="Create a public Gradio link"
@@ -1258,7 +1191,7 @@ def main() -> None:
         print("Start the API first, or pass --api-url.")
 
     frame_rate = _fetch_frame_rate(api_url)
-    store = Store(args.data_dir, presets_path=args.presets_file)
+    store = Store(args.data_dir)
     build_demo(api_url, store, frame_rate).launch(
         server_name=args.host,
         server_port=args.port,

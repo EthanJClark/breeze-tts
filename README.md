@@ -108,11 +108,15 @@ python webui.py --api-url http://127.0.0.1:7860
 
 Open **http://127.0.0.1:7861**.
 
-- **Generate** — script, voice description, performance direction, presets, saved reference voices, takes, and stop.
-- **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, seed, and timeout.
-- **Library** — saved instructions, reference voices, and scripts.
+The Generate tab asks two questions: what the voice should sound like, and whether you have a sample clip.
 
-Saved data lives in `~/.local/share/breeze-tts/`; override it with `--data-dir`.
+- **Voice** — choose **Describe a voice** or **Clone from a clip**.
+  - *Describe* shows one **Voice & delivery** field. Vocal events such as `(laugh)`, `(sigh)`, `(cough)`, and `(clears throat)` can be typed anywhere in the script; the Tips panel lists them.
+  - *Clone* takes an uploaded or recorded clip plus its exact transcript, with an optional delivery direction.
+- **Presets** — **Save preset** stores the voice source, description, delivery, reference clip, and every sampling setting in one JSON file. The script is deliberately excluded. Pick a preset from the dropdown to load it, or use **Export** / **Import JSON** to move presets between machines.
+- **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, takes, seed, timeout, and autoplay.
+
+Presets are stored as self-contained JSON files (the reference clip is embedded) in `~/.local/share/breeze-tts/presets/`. Override the root with `--data-dir`.
 
 ## Batch API
 

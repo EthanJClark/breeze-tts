@@ -1,12 +1,16 @@
 """Persistent storage for the Breeze TTS web UI.
 
-Keeps settings, instruction presets, scripts, and saved reference voices in a
-single data directory. All JSON writes are atomic so a crash cannot leave a
-half-written file behind.
+Keeps settings, presets, and saved reference voices in a single data directory.
+Presets are self-contained JSON files (reference audio is embedded) so one file
+can be exported and imported on another machine. All writes are atomic so a
+crash cannot leave a half-written file behind.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import math
 import os
@@ -15,12 +19,17 @@ import shutil
 import tempfile
 import threading
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 DEFAULT_DATA_DIR = Path(
     os.environ.get("BREEZE_DATA_DIR") or Path.home() / ".local" / "share" / "breeze-tts"
 ).expanduser()
+
+PRESET_VERSION = 1
+VOICE_DESCRIBE = "Describe a voice"
+VOICE_CLONE = "Clone from a clip"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "cfg_scale": 4.0,
@@ -36,36 +45,40 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "autoplay": True,
 }
 
+
+def _default_preset(description: str) -> dict[str, Any]:
+    return {
+        "voice_source": VOICE_DESCRIBE,
+        "description": description,
+        "delivery": "",
+        "reference": None,
+        "settings": {
+            **DEFAULT_SETTINGS,
+            "cfg_scale": 4.0,
+            "temperature": 0.9,
+            "seed": 42,
+        },
+    }
+
+
 DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
-    "Santa": {
-        "voice": (
-            "A warm, deep, jolly old man's voice with a rich, booming chest "
-            "resonance and a gentle rasp. Speak slowly and cheerfully in a "
-            "classic grandfatherly Santa Claus delivery, with a merry chuckle "
-            "just beneath the words and a reassuring, friendly tone. Crisp "
-            "articulation, hearty low notes, and a slight smile in the voice. "
-            "Never rushed."
-        ),
-        "performance": "",
-        "cfg_scale": 4.0,
-        "temperature": 0.9,
-        "seed": 42,
-    },
-    "Dark wizard": {
-        "voice": (
-            "An ancient male wizard with a deep, raspy, gravelly voice. Speak "
-            "slowly and ominously with a theatrical, menacing delivery. Drag "
-            "out the vowels, hiss the sibilants, and let a dry, cruel laugh "
-            "rumble low in his chest. His tone is cold, patient, and utterly "
-            "certain of his power, as if he has all the time in the world. "
-            "Close and intimate, like he is leaning toward the listener in a "
-            "dark stone hall."
-        ),
-        "performance": "",
-        "cfg_scale": 4.0,
-        "temperature": 0.9,
-        "seed": 42,
-    },
+    "Santa": _default_preset(
+        "A warm, deep, jolly old man's voice with a rich, booming chest "
+        "resonance and a gentle rasp. Speak slowly and cheerfully in a "
+        "classic grandfatherly Santa Claus delivery, with a merry chuckle "
+        "just beneath the words and a reassuring, friendly tone. Crisp "
+        "articulation, hearty low notes, and a slight smile in the voice. "
+        "Never rushed."
+    ),
+    "Dark wizard": _default_preset(
+        "An ancient male wizard with a deep, raspy, gravelly voice. Speak "
+        "slowly and ominously with a theatrical, menacing delivery. Drag "
+        "out the vowels, hiss the sibilants, and let a dry, cruel laugh "
+        "rumble low in his chest. His tone is cold, patient, and utterly "
+        "certain of his power, as if he has all the time in the world. "
+        "Close and intimate, like he is leaning toward the listener in a "
+        "dark stone hall."
+    ),
 }
 
 
@@ -99,53 +112,86 @@ def normalize_settings(values: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def normalize_preset(value: Any) -> dict[str, Any] | None:
-    if isinstance(value, str):
-        voice, performance = value.strip(), ""
-    elif isinstance(value, dict):
-        voice = str(value.get("voice") or value.get("instruction") or "").strip()
-        performance = str(value.get("performance") or "").strip()
-    else:
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _slug(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return cleaned[:80] or "preset"
+
+
+def _safe_filename(value: str) -> str:
+    name = Path(str(value)).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")
+    return name or "reference.wav"
+
+
+def _decode_audio(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    return value.strip()
+
+
+def normalize_preset(payload: Any, fallback_name: str = "") -> dict[str, Any] | None:
+    """Validate a preset payload and clamp every user-controlled value."""
+    if not isinstance(payload, dict):
         return None
-    if not voice and not performance:
+
+    name = str(payload.get("name") or fallback_name).strip() or "Preset"
+    description = str(payload.get("description") or "").strip()
+    delivery = str(payload.get("delivery") or "").strip()
+    voice_source = str(payload.get("voice_source") or VOICE_DESCRIBE).strip()
+    if not voice_source:
+        voice_source = VOICE_DESCRIBE
+
+    reference = None
+    raw_reference = payload.get("reference")
+    if isinstance(raw_reference, dict):
+        audio_b64 = _decode_audio(raw_reference.get("audio_b64"))
+        if audio_b64:
+            reference = {
+                "filename": _safe_filename(
+                    raw_reference.get("filename") or "reference.wav"
+                ),
+                "text": str(raw_reference.get("text") or "").strip(),
+                "audio_b64": audio_b64,
+            }
+
+    if not description and not delivery and reference is None:
         return None
+
+    created = str(payload.get("created") or "").strip() or _utc_now()
     return {
-        "voice": voice,
-        "performance": performance,
-        "cfg_scale": _clamp(
-            value.get("cfg_scale") if isinstance(value, dict) else 4.0, 4.0, 1.0, 6.0
-        ),
-        "temperature": _clamp(
-            value.get("temperature") if isinstance(value, dict) else 0.9, 0.9, 0.1, 2.0
-        ),
-        "seed": int(
-            _clamp(
-                value.get("seed") if isinstance(value, dict) else 42, 42, 0, 2**31 - 1
-            )
-        ),
+        "version": PRESET_VERSION,
+        "name": name,
+        "created": created,
+        "voice_source": voice_source,
+        "description": description,
+        "delivery": delivery,
+        "reference": reference,
+        "settings": normalize_settings(payload.get("settings")),
     }
 
 
 class Store:
     """Read and write the web UI's persistent state."""
 
-    def __init__(
-        self,
-        data_dir: Path | str = DEFAULT_DATA_DIR,
-        *,
-        presets_path: Path | str | None = None,
-    ) -> None:
+    def __init__(self, data_dir: Path | str = DEFAULT_DATA_DIR) -> None:
         self.data_dir = Path(data_dir).expanduser()
         self.settings_path = self.data_dir / "settings.json"
-        self.presets_path = (
-            Path(presets_path).expanduser()
-            if presets_path is not None
-            else self.data_dir / "instruction_presets.json"
-        )
-        self.scripts_path = self.data_dir / "scripts.json"
+        self.presets_dir = self.data_dir / "presets"
+        self.preset_refs_dir = self.data_dir / "preset_references"
+        self.exports_dir = self.data_dir / "exports"
+        self.legacy_presets_path = self.data_dir / "instruction_presets.json"
         self.voices_path = self.data_dir / "voice_profiles.json"
         self.references_dir = self.data_dir / "references"
         self._lock = threading.RLock()
+        self._presets_ready = False
 
     # -- generic JSON helpers -------------------------------------------------
 
@@ -196,65 +242,218 @@ class Store:
             self._write_json(self.settings_path, {"version": 1, "settings": normalized})
         return normalized
 
-    # -- instruction presets --------------------------------------------------
+    # -- presets --------------------------------------------------------------
 
-    def load_presets(self) -> tuple[dict[str, dict[str, Any]], str | None]:
+    def _ensure_presets(self) -> None:
+        if self._presets_ready:
+            return
         with self._lock:
-            data, warning = self._read_json(self.presets_path)
-        if data is None:
-            return {
-                name: dict(value) for name, value in DEFAULT_PRESETS.items()
-            }, warning
+            if self._presets_ready:
+                return
+            if not self.presets_dir.exists():
+                self.presets_dir.mkdir(parents=True, exist_ok=True)
+                self._presets_ready = True
+                self._import_legacy_presets()
+                self._seed_default_presets()
+            else:
+                self._presets_ready = True
+
+    def _import_legacy_presets(self) -> None:
+        data, _ = self._read_json(self.legacy_presets_path)
         raw = data.get("presets", data) if isinstance(data, dict) else None
         if not isinstance(raw, dict):
-            return (
-                {name: dict(value) for name, value in DEFAULT_PRESETS.items()},
-                warning or "Instruction presets are invalid; using built-in examples.",
-            )
-        presets = {}
+            return
         for name, value in raw.items():
-            normalized = normalize_preset(value)
-            if normalized is not None and str(name).strip():
-                presets[str(name).strip()] = normalized
-        return presets, warning
+            legacy = self._legacy_preset(name, value)
+            if legacy is not None:
+                self._write_preset(str(name).strip(), legacy)
 
-    def save_presets(self, presets: dict[str, dict[str, Any]]) -> None:
-        cleaned = {}
-        for name, value in presets.items():
-            normalized = normalize_preset(value)
-            if normalized is not None and str(name).strip():
-                cleaned[str(name).strip()] = normalized
-        with self._lock:
-            self._write_json(
-                self.presets_path,
-                {"version": 2, "presets": dict(sorted(cleaned.items()))},
-            )
-
-    # -- scripts --------------------------------------------------------------
-
-    def load_scripts(self) -> tuple[dict[str, str], str | None]:
-        with self._lock:
-            data, warning = self._read_json(self.scripts_path)
-        raw = data.get("scripts", data) if isinstance(data, dict) else None
-        if not isinstance(raw, dict):
-            return {}, warning
+    @staticmethod
+    def _legacy_preset(name: Any, value: Any) -> dict[str, Any] | None:
+        if not str(name).strip():
+            return None
+        if isinstance(value, str):
+            voice, performance = value.strip(), ""
+            cfg_scale, temperature, seed = 4.0, 0.9, 42
+        elif isinstance(value, dict):
+            voice = str(value.get("voice") or value.get("instruction") or "").strip()
+            performance = str(value.get("performance") or "").strip()
+            cfg_scale = _clamp(value.get("cfg_scale"), 4.0, 1.0, 6.0)
+            temperature = _clamp(value.get("temperature"), 0.9, 0.1, 2.0)
+            seed = int(_clamp(value.get("seed"), 42, 0, 2**31 - 1))
+        else:
+            return None
+        description = "\n\n".join(part for part in (voice, performance) if part)
+        if not description:
+            return None
         return {
-            str(name).strip(): str(text).strip()
-            for name, text in raw.items()
-            if str(name).strip() and isinstance(text, str) and text.strip()
-        }, warning
-
-    def save_scripts(self, scripts: dict[str, str]) -> None:
-        cleaned = {
-            str(name).strip(): str(text).strip()
-            for name, text in scripts.items()
-            if str(name).strip() and str(text).strip()
+            "voice_source": VOICE_DESCRIBE,
+            "description": description,
+            "delivery": "",
+            "reference": None,
+            "settings": {
+                **DEFAULT_SETTINGS,
+                "cfg_scale": cfg_scale,
+                "temperature": temperature,
+                "seed": seed,
+            },
         }
+
+    def _seed_default_presets(self) -> None:
+        for name, preset in DEFAULT_PRESETS.items():
+            if self._find_preset_path(name) is None:
+                self._write_preset(name, preset)
+
+    def _preset_paths(self) -> list[Path]:
+        return sorted(self.presets_dir.glob("*.json"))
+
+    def _find_preset_path(self, name: str) -> Path | None:
+        for path in self._preset_paths():
+            data, _ = self._read_json(path)
+            if isinstance(data, dict) and str(data.get("name") or "").strip() == name:
+                return path
+        return None
+
+    def _allocate_preset_path(self, name: str) -> Path:
+        base = _slug(name)
+        candidate = self.presets_dir / f"{base}.json"
+        counter = 2
+        while candidate.exists():
+            candidate = self.presets_dir / f"{base}-{counter}.json"
+            counter += 1
+        return candidate
+
+    def _write_preset(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = normalize_preset({**payload, "name": name})
+        if normalized is None:
+            raise ValueError("A preset needs a description, delivery, or reference.")
+        path = self._find_preset_path(name)
+        if path is not None:
+            existing, _ = self._read_json(path)
+            if isinstance(existing, dict) and existing.get("created"):
+                normalized["created"] = str(existing["created"])
+        else:
+            path = self._allocate_preset_path(name)
+        self._write_json(path, normalized)
+        return normalized
+
+    def list_presets(self) -> tuple[dict[str, dict[str, Any]], str | None]:
         with self._lock:
-            self._write_json(
-                self.scripts_path,
-                {"version": 1, "scripts": dict(sorted(cleaned.items()))},
+            self._ensure_presets()
+            warning = None
+            presets: dict[str, dict[str, Any]] = {}
+            for path in self._preset_paths():
+                data, read_warning = self._read_json(path)
+                if read_warning:
+                    warning = warning or read_warning
+                    continue
+                normalized = normalize_preset(data)
+                if normalized is None:
+                    warning = warning or f"{path.name} is not a valid preset; skipped."
+                    continue
+                presets[normalized["name"]] = normalized
+        return (
+            dict(sorted(presets.items(), key=lambda item: item[0].lower())),
+            warning,
+        )
+
+    def load_preset(self, name: str | None) -> dict[str, Any] | None:
+        if not name:
+            return None
+        presets, _ = self.list_presets()
+        return presets.get(name)
+
+    def save_preset(self, name: str, payload: dict[str, Any]) -> str:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Enter a preset name.")
+        with self._lock:
+            self._ensure_presets()
+            normalized = self._write_preset(name, payload)
+        return normalized["name"]
+
+    def delete_preset(self, name: str | None) -> bool:
+        if not name:
+            return False
+        with self._lock:
+            self._ensure_presets()
+            path = self._find_preset_path(name)
+            if path is None:
+                return False
+            path.unlink(missing_ok=True)
+            return True
+
+    def export_preset(self, name: str | None) -> Path:
+        preset = self.load_preset(name)
+        if preset is None:
+            raise ValueError(f"Preset not found: {name}")
+        with self._lock:
+            self.exports_dir.mkdir(parents=True, exist_ok=True)
+            path = self.exports_dir / f"{_slug(preset['name'])}.json"
+            self._write_json(path, preset)
+        return path
+
+    def import_preset(self, raw: str | bytes, filename: str | None = None) -> str:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("That file is not valid JSON.") from exc
+        fallback = Path(filename).stem if filename else ""
+        preset = normalize_preset(data, fallback_name=fallback)
+        if preset is None:
+            raise ValueError(
+                "That JSON has no voice description, delivery, or reference clip."
             )
+        name = preset["name"]
+        with self._lock:
+            presets, _ = self.list_presets()
+            candidate = name
+            counter = 2
+            while candidate in presets:
+                candidate = f"{name} ({counter})"
+                counter += 1
+            preset["name"] = candidate
+            self.save_preset(candidate, preset)
+        return candidate
+
+    def materialize_reference(self, name: str, preset: dict[str, Any]) -> Path | None:
+        """Write an embedded reference clip to disk and return its path."""
+        reference = preset.get("reference")
+        if not isinstance(reference, dict):
+            return None
+        audio_b64 = reference.get("audio_b64")
+        if not audio_b64:
+            return None
+        try:
+            data = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        filename = _safe_filename(reference.get("filename") or "reference.wav")
+        suffix = Path(filename).suffix or ".wav"
+        digest = hashlib.sha1(audio_b64.encode("ascii")).hexdigest()[:10]
+        destination = self.preset_refs_dir / f"{_slug(name)}-{digest}{suffix}"
+        if not destination.exists():
+            with self._lock:
+                if not destination.exists():
+                    self.preset_refs_dir.mkdir(parents=True, exist_ok=True)
+                    fd, temp_name = tempfile.mkstemp(
+                        prefix=f"{destination.name}.",
+                        suffix=".tmp",
+                        dir=destination.parent,
+                    )
+                    try:
+                        with os.fdopen(fd, "wb") as temp_file:
+                            temp_file.write(data)
+                            temp_file.flush()
+                            os.fsync(temp_file.fileno())
+                        os.replace(temp_name, destination)
+                    except BaseException:
+                        try:
+                            os.unlink(temp_name)
+                        except OSError:
+                            pass
+                        raise
+        return destination
 
     # -- reference voices -----------------------------------------------------
 

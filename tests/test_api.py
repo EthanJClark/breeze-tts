@@ -39,6 +39,7 @@ def test_api_exposes_only_health_and_streaming_speech() -> None:
     assert "/v1/audio/speech" in paths
     assert "/v1/audio/speech/batch" in paths
     assert "/v1/model" in paths
+    assert "/v1/cancel" in paths
     assert "/api/ref-audio-codes" not in paths
 
 
@@ -261,6 +262,56 @@ def test_speech_applies_sampling(monkeypatch) -> None:
         response._close()
 
     assert not api._request_lock.locked()
+
+
+def test_cancel_is_a_noop_when_no_request_is_running() -> None:
+    assert not api._request_lock.locked()
+
+    response = TestClient(app).post("/v1/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": False}
+    assert not api._cancel_event.is_set()
+
+
+def test_cancel_signals_the_running_request() -> None:
+    assert api._request_lock.acquire(blocking=False)
+    try:
+        response = TestClient(app).post("/v1/cancel")
+
+        assert response.status_code == 200
+        assert response.json() == {"cancelled": True}
+        assert api._cancel_event.is_set()
+    finally:
+        api._cancel_event.clear()
+        api._request_lock.release()
+
+
+def test_speech_stops_sampling_after_cancel(monkeypatch) -> None:
+    _speech_state(monkeypatch)
+    sampled = []
+
+    def iter_audio_chunks(inputs, *, request_id, seed, token_observer):
+        for index in range(5):
+            sampled.append(index)
+            yield SimpleNamespace(audio=np.ones(4, dtype=np.float32))
+
+    app.state.runtime.iter_audio_chunks = iter_audio_chunks
+    response = asyncio.run(speech(**_speech_kwargs()))
+    api._cancel_event.set()
+
+    async def collect() -> list[bytes]:
+        return [part async for part in response.body_iterator]
+
+    try:
+        assert asyncio.run(collect()) == []
+    finally:
+        response._close()
+
+    assert sampled == [0]
+    assert not api._request_lock.locked()
+    # The next request must start from a clean slate.
+    assert not api._cancel_event.is_set()
 
 
 def test_speech_clamps_max_new_tokens(monkeypatch) -> None:

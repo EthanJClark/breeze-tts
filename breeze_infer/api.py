@@ -76,6 +76,10 @@ class ApiSettings:
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+# Set by POST /v1/cancel; the running request stops at its next chunk boundary.
+# Closing the socket is not enough: a client that disappears mid-stream cannot
+# interrupt a sampling step that is already running in the worker thread.
+_cancel_event = threading.Event()
 logger = logging.getLogger(__name__)
 
 
@@ -356,6 +360,19 @@ def model_info() -> JSONResponse:
     return JSONResponse(_settings.model_info)
 
 
+@app.post("/v1/cancel")
+def cancel() -> JSONResponse:
+    """Stop the running request at its next chunk boundary.
+
+    The API serializes inference, so there is at most one request to cancel. When
+    none is running this is a no-op, which makes a repeat Stop harmless.
+    """
+    if not _request_lock.locked():
+        return JSONResponse({"cancelled": False})
+    _cancel_event.set()
+    return JSONResponse({"cancelled": True})
+
+
 @app.post("/v1/audio/speech")
 async def speech(
     text: str = Form(...),
@@ -382,6 +399,8 @@ async def speech(
             if reference_path is not None:
                 reference_path.unlink(missing_ok=True)
         finally:
+            # Reset before releasing the lock so the next request starts clean.
+            _cancel_event.clear()
             _request_lock.release()
 
     try:
@@ -456,6 +475,10 @@ async def speech(
             )
         ) as chunks:
             for chunk in chunks:
+                if _cancel_event.is_set():
+                    # Returning ends the response normally; the wrapper's
+                    # finally closes the sampler and releases the lock.
+                    return
                 pcm = _pcm16(chunk.audio)
                 if pcm:
                     yield pcm
@@ -607,6 +630,8 @@ async def speech_batch(
             if reference_path is not None:
                 reference_path.unlink(missing_ok=True)
         finally:
+            # Reset before releasing the lock so the next request starts clean.
+            _cancel_event.clear()
             _request_lock.release()
 
     try:

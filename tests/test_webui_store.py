@@ -118,9 +118,24 @@ def test_preset_round_trip(tmp_path):
     assert store.preset_path("missing") is None
 
 
-def test_app_data_dir_lives_in_breeze2():
+def test_app_data_dir_lives_in_home():
     assert APP_DATA_DIR.name == ".breeze2"
-    assert APP_DATA_DIR.parent == Path(webui_store.__file__).resolve().parent
+    assert APP_DATA_DIR.parent == Path.home()
+
+
+def test_store_migrates_repo_presets(tmp_path, monkeypatch):
+    repo_data = tmp_path / "repo" / ".breeze2"
+    (repo_data / "presets").mkdir(parents=True)
+    (repo_data / "presets" / "Repo.json").write_text('{"name": "Repo"}', encoding="utf-8")
+    destination = tmp_path / "home" / ".breeze2"
+
+    monkeypatch.setattr(webui_store, "APP_DATA_DIR", destination)
+    monkeypatch.setattr(webui_store, "LEGACY_DATA_DIR", tmp_path / "missing")
+    monkeypatch.setattr(webui_store, "REPO_DATA_DIR", repo_data)
+
+    Store(destination)
+
+    assert (destination / "presets" / "Repo.json").is_file()
 
 
 def test_migrate_data_dir_copies_missing_files_without_overwriting(tmp_path):

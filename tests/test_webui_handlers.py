@@ -1,11 +1,20 @@
 import base64
+import http.server
+import threading
+import time
 from functools import partial
+from typing import ClassVar
 
 import gradio as gr
 import pytest
 
+import webui
 from webui import (
+    GenerationCancelled,
+    GenerationCancelToken,
+    GenerationControl,
     GenerationError,
+    _request_once,
     _resolve_voice_inputs,
     apply_preset_state,
     clear_handler,
@@ -21,6 +30,7 @@ from webui import (
     save_preset_handler,
     select_preset_handler,
     select_take,
+    stop_generation,
 )
 from webui_store import VOICE_CLONE, VOICE_DESCRIBE, Store
 
@@ -547,3 +557,201 @@ def test_handler_output_arities(tmp_path):
     assert len(on_voice_change(VOICE_DESCRIBE)) == 3
     assert len(on_seed_mode_change("fixed")) == 2
     assert len(refresh_presets_handler(None, store=store)) == 3
+
+
+def test_cancel_token_calls_closers_once():
+    token = GenerationCancelToken()
+    calls = []
+    token.add_closer(lambda: calls.append("first"))
+
+    token.cancel()
+    token.cancel()
+
+    assert token.cancelled
+    assert calls == ["first"]
+
+
+def test_cancel_token_closes_late_registrations_immediately():
+    token = GenerationCancelToken()
+    token.cancel()
+
+    calls = []
+    token.add_closer(lambda: calls.append("closed"))
+
+    assert calls == ["closed"]
+
+
+def test_stop_generation_cancels_the_active_request(tmp_path):
+    control = GenerationControl()
+    token = control.begin()
+    token.add_closer(lambda: None)
+
+    outputs = stop_generation(control=control)
+
+    assert token.cancelled
+    assert control.cancel() is False
+    assert outputs[2] == "⏹ Stopped."
+
+
+class _SlowStreamHandler(http.server.BaseHTTPRequestHandler):
+    """Stream PCM slowly until the client asks the API to cancel."""
+
+    cancelled = threading.Event()
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        if self.path == "/v1/cancel":
+            _SlowStreamHandler.cancelled.set()
+            body = b'{"cancelled": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("X-Sample-Rate", "24000")
+        self.end_headers()
+        try:
+            for _ in range(500):
+                if _SlowStreamHandler.cancelled.is_set():
+                    return
+                self.wfile.write(b"\x00\x00" * 2400)
+                self.wfile.flush()
+                time.sleep(0.01)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+def _request_kwargs(api_url):
+    return {
+        "text": "hello",
+        "instruction": "A calm narrator.",
+        "reference_bytes": None,
+        "reference_filename": None,
+        "reference_text": "",
+        "cfg_scale": 4.0,
+        "temperature": 0.9,
+        "top_p": 1.0,
+        "top_k": 50,
+        "repetition_penalty": 1.1,
+        "max_new_tokens": 100,
+        "seed": 42,
+        "api_url": api_url,
+        "timeout": 30.0,
+    }
+
+
+def test_request_once_aborts_when_cancelled():
+    _SlowStreamHandler.cancelled.clear()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SlowStreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    token = GenerationCancelToken()
+    try:
+        timer = threading.Timer(0.3, token.cancel)
+        timer.start()
+        started = time.monotonic()
+        with pytest.raises(GenerationCancelled):
+            _request_once(
+                **_request_kwargs(f"http://127.0.0.1:{server.server_port}"),
+                cancel=token,
+            )
+        assert time.monotonic() - started < 5
+    finally:
+        token.cancel()
+        server.shutdown()
+        server.server_close()
+
+    # The client must tell the API to stop, or the model stays busy.
+    assert _SlowStreamHandler.cancelled.is_set()
+
+
+def test_request_once_reports_busy(monkeypatch):
+    class _Busy:
+        status_code = 409
+        headers: ClassVar[dict] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream(self, *args, **kwargs):
+            return _Busy()
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(webui.httpx, "Client", _Client)
+    monkeypatch.setattr(webui, "BUSY_RETRY_SECONDS", 0.0)
+
+    with pytest.raises(GenerationError, match="busy"):
+        _request_once(**_request_kwargs("http://127.0.0.1:1"))
+
+
+def test_request_once_retries_while_the_model_is_busy(monkeypatch):
+    class _Busy:
+        status_code = 409
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Ok:
+        status_code = 200
+        headers: ClassVar[dict] = {"X-Sample-Rate": "24000"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            yield b"\x00\x00" * 240
+
+    responses = [_Busy(), _Ok()]
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def stream(self, *args, **kwargs):
+            return responses.pop(0)
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(webui.httpx, "Client", _Client)
+    monkeypatch.setattr(webui, "BUSY_RETRY_INTERVAL", 0.0)
+
+    (rate, audio), duration = _request_once(**_request_kwargs("http://127.0.0.1:1"))
+
+    assert rate == 24000
+    assert audio.shape == (240,)
+    assert duration == pytest.approx(0.01)

@@ -24,8 +24,10 @@ from pathlib import Path
 from typing import Any
 
 APP_ROOT = Path(__file__).resolve().parent
-APP_DATA_DIR = APP_ROOT / ".breeze2"
+APP_DATA_DIR = Path.home() / ".breeze2"
 LEGACY_DATA_DIR = Path.home() / ".local" / "share" / "breeze-tts"
+# Earlier builds kept presets inside the repository. Copy that data forward too.
+REPO_DATA_DIR = APP_ROOT / ".breeze2"
 DEFAULT_DATA_DIR = Path(
     os.environ.get("BREEZE_DATA_DIR") or APP_DATA_DIR
 ).expanduser()
@@ -243,17 +245,18 @@ class Store:
         self._presets_ready = False
 
     def _migrate_legacy_data(self) -> None:
-        """Bring data from the old home-directory location into .breeze2."""
+        """Copy data from older default locations into ~/.breeze2 once."""
         try:
             is_app_data = self.data_dir.resolve() == APP_DATA_DIR.resolve()
         except OSError:
             is_app_data = False
         if not is_app_data:
             return
-        try:
-            migrate_data_dir(LEGACY_DATA_DIR, self.data_dir)
-        except OSError:
-            pass
+        for source in (LEGACY_DATA_DIR, REPO_DATA_DIR):
+            try:
+                migrate_data_dir(source, self.data_dir)
+            except OSError:
+                pass
 
     # -- generic JSON helpers -------------------------------------------------
 

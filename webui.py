@@ -13,6 +13,7 @@ import argparse
 import base64
 import os
 import secrets
+import threading
 import time
 from functools import partial
 from pathlib import Path
@@ -32,6 +33,12 @@ from webui_store import (
 DEFAULT_API_URL = "http://127.0.0.1:7860"
 DEFAULT_SAMPLE_RATE = 24000
 FALLBACK_FRAME_RATE = 12.5
+# Stop can race the request it just cancelled: the API frees the model at the
+# next chunk boundary. Wait briefly for that instead of failing with a 409.
+BUSY_RETRY_SECONDS = 10.0
+BUSY_RETRY_INTERVAL = 0.25
+CANCEL_RETRY_SECONDS = 15.0
+CANCEL_RETRY_INTERVAL = 0.25
 MAX_NEW_TOKENS = 1500
 DEFAULT_TIMEOUT = 600.0
 
@@ -45,6 +52,78 @@ EVENT_TAGS = [
 
 class GenerationError(Exception):
     """A user-facing synthesis error."""
+
+
+class GenerationCancelled(Exception):
+    """Raised inside a request that the user stopped."""
+
+
+def _run_closer(closer) -> None:
+    try:
+        closer()
+    except (httpx.HTTPError, OSError, RuntimeError):
+        # Cancelling must never raise; the request may already be gone.
+        return
+
+
+class GenerationCancelToken:
+    """Lets the Stop button abort an in-flight API request.
+
+    The Gradio event is cancelled immediately, but its worker thread is still
+    blocked reading the response. The registered closers tell the API to stop
+    the request, which frees the model and ends our read.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._closers: list = []
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def add_closer(self, closer) -> None:
+        with self._lock:
+            self._closers.append(closer)
+            cancelled = self._event.is_set()
+        if cancelled:
+            _run_closer(closer)
+
+    def cancel(self) -> None:
+        self._event.set()
+        with self._lock:
+            closers, self._closers = self._closers, []
+        for closer in closers:
+            _run_closer(closer)
+
+
+class GenerationControl:
+    """Track the generation currently running so Stop can cancel it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current: GenerationCancelToken | None = None
+
+    def begin(self) -> GenerationCancelToken:
+        token = GenerationCancelToken()
+        with self._lock:
+            self._current = token
+        return token
+
+    def end(self, token: GenerationCancelToken) -> None:
+        with self._lock:
+            if self._current is token:
+                self._current = None
+
+    def cancel(self) -> bool:
+        with self._lock:
+            token = self._current
+            self._current = None
+        if token is None:
+            return False
+        token.cancel()
+        return True
 
 
 def _mode(has_reference: bool, has_instruction: bool) -> str:
@@ -122,6 +201,33 @@ def _fetch_frame_rate(api_url: str) -> float:
         return FALLBACK_FRAME_RATE
 
 
+def _stop_remote(api_url: str) -> None:
+    """Ask the API to stop the running request.
+
+    Closing our socket is not enough: the API is already inside a sampling step
+    and would keep the model locked until the response finished, and closing an
+    fd from another thread does not reliably wake a blocked read anyway. So we
+    tell the server to stop; its stream then ends and our read returns.
+    """
+    threading.Thread(target=_post_cancel, args=(api_url,), daemon=True).start()
+
+
+def _post_cancel(api_url: str) -> None:
+    deadline = time.monotonic() + CANCEL_RETRY_SECONDS
+    while True:
+        try:
+            response = httpx.post(f"{api_url}/v1/cancel", timeout=2.0)
+            if response.status_code in (200, 404, 405):
+                # 200 means the running request will stop; 404/405 means this
+                # API build has no cancel endpoint, so retrying cannot help.
+                return
+        except (httpx.HTTPError, OSError):
+            pass
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(CANCEL_RETRY_INTERVAL)
+
+
 def _request_once(
     *,
     text: str,
@@ -138,6 +244,7 @@ def _request_once(
     seed: int,
     api_url: str,
     timeout: float,
+    cancel: GenerationCancelToken | None = None,
 ) -> tuple[tuple[int, np.ndarray], float]:
     data = {
         "text": text,
@@ -164,28 +271,66 @@ def _request_once(
         }
 
     timeout_config = httpx.Timeout(connect=5.0, read=timeout, write=60.0, pool=5.0)
-    try:
-        with httpx.Client(timeout=timeout_config) as client:
-            response = client.post(f"{api_url}/v1/audio/speech", data=data, files=files)
-    except httpx.ConnectError as exc:
-        raise GenerationError(
-            f"Cannot reach the Breeze TTS API at `{api_url}`. Start it first."
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise GenerationError(f"The API timed out after {timeout:g} seconds.") from exc
-    except httpx.HTTPError as exc:
-        raise GenerationError(f"API request failed: {exc}") from exc
+    if cancel is not None:
+        cancel.add_closer(partial(_stop_remote, api_url))
 
-    if response.status_code == 409:
-        raise GenerationError("The model is busy with another request. Try again.")
-    if response.status_code >= 400:
-        raise GenerationError(_error_detail(response))
+    content = bytearray()
+    headers: httpx.Headers = httpx.Headers()
+    deadline = time.monotonic() + BUSY_RETRY_SECONDS
+    while True:
+        if cancel is not None and cancel.cancelled:
+            raise GenerationCancelled
+        busy = False
+        try:
+            with httpx.Client(timeout=timeout_config) as client:
+                if cancel is not None and cancel.cancelled:
+                    raise GenerationCancelled
+                with client.stream(
+                    "POST", f"{api_url}/v1/audio/speech", data=data, files=files
+                ) as response:
+                    if response.status_code == 409:
+                        busy = True
+                    elif response.status_code >= 400:
+                        response.read()
+                        raise GenerationError(_error_detail(response))
+                    else:
+                        for chunk in response.iter_bytes():
+                            if cancel is not None and cancel.cancelled:
+                                raise GenerationCancelled
+                            content.extend(chunk)
+                        if cancel is not None and cancel.cancelled:
+                            raise GenerationCancelled
+                        headers = response.headers
+        except (GenerationError, GenerationCancelled):
+            raise
+        except httpx.ConnectError as exc:
+            if cancel is not None and cancel.cancelled:
+                raise GenerationCancelled from exc
+            raise GenerationError(
+                f"Cannot reach the Breeze TTS API at `{api_url}`. Start it first."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            if cancel is not None and cancel.cancelled:
+                raise GenerationCancelled from exc
+            raise GenerationError(f"The API timed out after {timeout:g} seconds.") from exc
+        except (httpx.HTTPError, RuntimeError) as exc:
+            if cancel is not None and cancel.cancelled:
+                raise GenerationCancelled from exc
+            raise GenerationError(f"API request failed: {exc}") from exc
 
-    pcm = np.frombuffer(response.content, dtype="<i2")
+        if not busy:
+            break
+        if cancel is not None and cancel.cancelled:
+            raise GenerationCancelled
+        if time.monotonic() >= deadline:
+            raise GenerationError("The model is busy with another request. Try again.")
+        time.sleep(BUSY_RETRY_INTERVAL)
+
+    pcm = np.frombuffer(bytes(content), dtype="<i2")
     if pcm.size == 0:
         raise GenerationError("The API returned no audio.")
 
-    sample_rate = int(response.headers.get("X-Sample-Rate", DEFAULT_SAMPLE_RATE))
+    sample_rate = int(headers.get("X-Sample-Rate", DEFAULT_SAMPLE_RATE))
     audio = (pcm.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
     return (sample_rate, audio), pcm.size / sample_rate
 
@@ -242,6 +387,7 @@ def run_generation(
     *,
     api_url: str,
     frame_rate: float,
+    control: GenerationControl | None = None,
 ):
     text = (text or "").strip()
 
@@ -317,90 +463,110 @@ def run_generation(
 
     results: list[dict] = []
     started = time.perf_counter()
-    yield _generation_outputs(
-        None,
-        [],
-        results,
-        f"⏳ Generating {take_count} take{'s' if take_count != 1 else ''}…",
-        summary,
-        busy=True,
-        reset_audio=True,
-    )
-
-    for index, take_seed in enumerate(seeds, start=1):
+    cancel_token = control.begin() if control is not None else None
+    try:
         yield _generation_outputs(
-            results[-1]["audio"] if results else None,
-            [item["label"] for item in results],
+            None,
+            [],
             results,
-            f"⏳ Take {index}/{take_count} · seed {take_seed}…",
+            f"⏳ Generating {take_count} take{'s' if take_count != 1 else ''}…",
             summary,
             busy=True,
-            reset_audio=not results,
-            last_seed=results[-1]["seed"] if results else None,
+            reset_audio=True,
         )
-        try:
-            audio, duration = _request_once(
-                text=text,
-                instruction=instruction,
-                reference_bytes=reference_bytes,
-                reference_filename=reference_filename,
-                reference_text=resolved_ref_text,
-                cfg_scale=effective_cfg,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                top_k=int(top_k),
-                repetition_penalty=float(repetition_penalty),
-                max_new_tokens=max_new_tokens,
-                seed=take_seed,
-                api_url=api_url,
-                timeout=timeout_value,
-            )
-        except GenerationError as exc:
+
+        for index, take_seed in enumerate(seeds, start=1):
             yield _generation_outputs(
                 results[-1]["audio"] if results else None,
                 [item["label"] for item in results],
                 results,
-                f"❌ {exc}",
+                f"⏳ Take {index}/{take_count} · seed {take_seed}…",
                 summary,
-                busy=False,
+                busy=True,
                 reset_audio=not results,
                 last_seed=results[-1]["seed"] if results else None,
             )
-            return
+            try:
+                audio, duration = _request_once(
+                    text=text,
+                    instruction=instruction,
+                    reference_bytes=reference_bytes,
+                    reference_filename=reference_filename,
+                    reference_text=resolved_ref_text,
+                    cfg_scale=effective_cfg,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k),
+                    repetition_penalty=float(repetition_penalty),
+                    max_new_tokens=max_new_tokens,
+                    seed=take_seed,
+                    api_url=api_url,
+                    timeout=timeout_value,
+                    cancel=cancel_token,
+                )
+            except GenerationCancelled:
+                yield _generation_outputs(
+                    results[-1]["audio"] if results else None,
+                    [item["label"] for item in results],
+                    results,
+                    "⏹ Stopped.",
+                    summary,
+                    busy=False,
+                    reset_audio=not results,
+                    last_seed=results[-1]["seed"] if results else None,
+                )
+                return
+            except GenerationError as exc:
+                yield _generation_outputs(
+                    results[-1]["audio"] if results else None,
+                    [item["label"] for item in results],
+                    results,
+                    f"❌ {exc}",
+                    summary,
+                    busy=False,
+                    reset_audio=not results,
+                    last_seed=results[-1]["seed"] if results else None,
+                )
+                return
 
-        label = f"Take {index} · seed {take_seed}"
-        results.append(
-            {
-                "label": label,
-                "audio": audio,
-                "seed": take_seed,
-                "duration": duration,
-            }
-        )
+            label = f"Take {index} · seed {take_seed}"
+            results.append(
+                {
+                    "label": label,
+                    "audio": audio,
+                    "seed": take_seed,
+                    "duration": duration,
+                }
+            )
+            yield _generation_outputs(
+                audio,
+                [item["label"] for item in results],
+                results,
+                f"✅ {label} · {duration:.2f} s",
+                summary,
+                busy=True,
+                reset_audio=True,
+                last_seed=take_seed,
+            )
+
+        elapsed = time.perf_counter() - started
         yield _generation_outputs(
-            audio,
+            results[-1]["audio"],
             [item["label"] for item in results],
             results,
-            f"✅ {label} · {duration:.2f} s",
+            f"✅ {take_count} take{'s' if take_count != 1 else ''} in {elapsed:.1f} s",
             summary,
-            busy=True,
-            reset_audio=True,
-            last_seed=take_seed,
+            busy=False,
+            last_seed=results[-1]["seed"],
         )
-
-    elapsed = time.perf_counter() - started
-    yield _generation_outputs(
-        results[-1]["audio"],
-        [item["label"] for item in results],
-        results,
-        f"✅ {take_count} take{'s' if take_count != 1 else ''} in {elapsed:.1f} s",
-        summary,
-        busy=False,
-        last_seed=results[-1]["seed"],
-    )
+    finally:
+        if control is not None and cancel_token is not None:
+            control.end(cancel_token)
 
 
-def stop_generation():
+def stop_generation(*, control: GenerationControl | None = None):
+    if control is not None:
+        control.cancel()
     return (
         gr.update(interactive=True),
         gr.update(interactive=False),
@@ -427,7 +593,9 @@ def select_take(label: str | None, results: list[dict] | None):
     )
 
 
-def clear_handler():
+def clear_handler(*, control: GenerationControl | None = None):
+    if control is not None:
+        control.cancel()
     return (
         "",
         _audio_output(None, reset=True),
@@ -1662,11 +1830,14 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             timeout,
         ]
 
+        generation_control = GenerationControl()
+
         generate_event = generate_button.click(
             partial(
                 run_generation,
                 api_url=api_url,
                 frame_rate=frame_rate,
+                control=generation_control,
             ),
             inputs=event_inputs,
             outputs=[
@@ -1683,14 +1854,14 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             api_name="generate",
         )
         stop_button.click(
-            stop_generation,
+            partial(stop_generation, control=generation_control),
             outputs=[generate_button, stop_button, status],
             cancels=[generate_event],
             queue=False,
             api_name="stop_generation",
         )
         clear_button.click(
-            clear_handler,
+            partial(clear_handler, control=generation_control),
             outputs=[
                 text,
                 output_audio,
@@ -1782,7 +1953,7 @@ def main() -> None:
         default=DEFAULT_DATA_DIR,
         help=(
             "Directory for settings, presets, and saved voices. Defaults to "
-            ".breeze2 next to webui.py (default: %(default)s)"
+            "~/.breeze2 in your home directory (default: %(default)s)"
         ),
     )
     parser.add_argument(

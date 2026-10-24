@@ -98,6 +98,8 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM. Start the API with `--fast-all` to enable the fast path.
 
+To interrupt a request, `POST /v1/cancel`. The running request stops at its next chunk boundary and releases the model, so the next request can start immediately.
+
 ## Web UI
 
 Start the API first, then run the UI in another terminal:
@@ -117,7 +119,7 @@ The Generate tab asks two questions: what the voice should sound like, and wheth
 - **Clear** — resets the script, generated audio, takes, and last-seed display without changing the current voice or sampling settings.
 - **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, takes, seed mode, timeout, and autoplay. In random seed mode, the **Last seed** field shows the seed used by the most recent take; saving a preset records that seed.
 
-Presets are stored as self-contained JSON files (the reference clip is embedded) in `.breeze2/presets/` at the root of this project. The app creates the folder automatically and reloads it from disk, so you can drop preset JSON files in directly. Existing presets from `~/.local/share/breeze-tts/` are copied over automatically the first time the new folder is used. Override the root with `--data-dir` or `BREEZE_DATA_DIR`.
+Presets are stored as self-contained JSON files (the reference clip is embedded) in `~/.breeze2/presets/` in your home directory, outside the repository. The app creates the folder automatically and reloads it from disk, so you can drop preset JSON files in directly. Existing presets from `~/.local/share/breeze-tts/` (or from an older checkout's `.breeze2/`) are copied over automatically the first time the new folder is used. Override the root with `--data-dir` or `BREEZE_DATA_DIR`.
 
 ## Batch API
 

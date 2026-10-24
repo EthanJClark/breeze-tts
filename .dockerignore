@@ -1,4 +1,5 @@
 .git
+.breeze2
 .venv
 .venv*
 .env

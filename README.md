@@ -113,10 +113,11 @@ The Generate tab asks two questions: what the voice should sound like, and wheth
 - **Voice** — choose **Describe a voice** or **Clone from a clip**.
   - *Describe* shows one **Voice & delivery** field. Vocal events such as `(laugh)`, `(sigh)`, `(cough)`, and `(clears throat)` can be typed anywhere in the script; the Tips panel lists them.
   - *Clone* takes an uploaded or recorded clip plus its exact transcript, with an optional delivery direction.
-- **Presets** — **Save preset** stores the voice source, description, delivery, reference clip, and every sampling setting in one JSON file. The script is deliberately excluded. Pick a preset from the dropdown to load it, or use **Export** / **Import JSON** to move presets between machines.
-- **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, takes, seed, timeout, and autoplay.
+- **Presets** — **Save preset** stores the voice source, description, delivery, reference clip, and every sampling setting in one JSON file. The script is deliberately excluded. Pick a preset from the dropdown to load it, use **Download JSON** to save a copy to your computer in one click, or use **Import JSON** to bring in a preset from somewhere else. If you have unsaved changes, switching presets asks whether to save them first.
+- **Clear** — resets the script, generated audio, takes, and last-seed display without changing the current voice or sampling settings.
+- **Settings** — CFG, temperature, top-p/top-k, repetition penalty, max duration, takes, seed mode, timeout, and autoplay. In random seed mode, the **Last seed** field shows the seed used by the most recent take; saving a preset records that seed.
 
-Presets are stored as self-contained JSON files (the reference clip is embedded) in `~/.local/share/breeze-tts/presets/`. Override the root with `--data-dir`.
+Presets are stored as self-contained JSON files (the reference clip is embedded) in `.breeze2/presets/` at the root of this project. The app creates the folder automatically and reloads it from disk, so you can drop preset JSON files in directly. Existing presets from `~/.local/share/breeze-tts/` are copied over automatically the first time the new folder is used. Override the root with `--data-dir` or `BREEZE_DATA_DIR`.
 
 ## Batch API
 

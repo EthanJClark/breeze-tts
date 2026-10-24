@@ -17,6 +17,7 @@ __pycache__/
 .coverage
 htmlcov/
 
+.breeze2/
 settings.json
 instruction_presets.json
 scripts.json

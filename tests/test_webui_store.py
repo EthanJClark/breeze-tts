@@ -1,14 +1,18 @@
 import base64
 import json
+from pathlib import Path
 
 import pytest
 
+import webui_store
 from webui_store import (
+    APP_DATA_DIR,
     DEFAULT_PRESETS,
     DEFAULT_SETTINGS,
     VOICE_CLONE,
     VOICE_DESCRIBE,
     Store,
+    migrate_data_dir,
     normalize_settings,
 )
 
@@ -110,6 +114,35 @@ def test_preset_round_trip(tmp_path):
     assert payload["version"] == 1
     assert payload["name"] == "Test voice"
     assert not list(tmp_path.rglob("*.tmp"))
+    assert store.preset_path("Test voice") == path
+    assert store.preset_path("missing") is None
+
+
+def test_app_data_dir_lives_in_breeze2():
+    assert APP_DATA_DIR.name == ".breeze2"
+    assert APP_DATA_DIR.parent == Path(webui_store.__file__).resolve().parent
+
+
+def test_migrate_data_dir_copies_missing_files_without_overwriting(tmp_path):
+    source = tmp_path / "old"
+    destination = tmp_path / "new"
+    (source / "presets").mkdir(parents=True)
+    (source / "presets" / "old.json").write_text('{"name": "old"}', encoding="utf-8")
+    (source / "settings.json").write_text('{"settings": {}}', encoding="utf-8")
+
+    copied = migrate_data_dir(source, destination)
+
+    assert len(copied) == 2
+    assert (destination / "presets" / "old.json").read_text(encoding="utf-8") == (
+        '{"name": "old"}'
+    )
+    assert (destination / "settings.json").is_file()
+
+    (source / "presets" / "old.json").write_text("changed", encoding="utf-8")
+    migrate_data_dir(source, destination)
+    assert (destination / "presets" / "old.json").read_text(encoding="utf-8") == (
+        '{"name": "old"}'
+    )
 
 
 def test_preset_settings_are_clamped(tmp_path):

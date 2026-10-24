@@ -23,8 +23,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+APP_ROOT = Path(__file__).resolve().parent
+APP_DATA_DIR = APP_ROOT / ".breeze2"
+LEGACY_DATA_DIR = Path.home() / ".local" / "share" / "breeze-tts"
 DEFAULT_DATA_DIR = Path(
-    os.environ.get("BREEZE_DATA_DIR") or Path.home() / ".local" / "share" / "breeze-tts"
+    os.environ.get("BREEZE_DATA_DIR") or APP_DATA_DIR
 ).expanduser()
 
 PRESET_VERSION = 1
@@ -127,6 +130,51 @@ def _safe_filename(value: str) -> str:
     return name or "reference.wav"
 
 
+def _copy_missing(source: Path, destination: Path) -> list[Path]:
+    """Copy files from source into destination without overwriting anything."""
+    copied: list[Path] = []
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        target = destination / item.name
+        if item.is_dir():
+            copied.extend(_copy_missing(item, target))
+        elif item.is_file() and not target.exists():
+            shutil.copy2(item, target)
+            copied.append(target)
+    return copied
+
+
+def migrate_data_dir(source: Path, destination: Path) -> list[Path]:
+    """One-time copy of known user data from an older data directory.
+
+    Only missing files are copied, so running this repeatedly is safe and it
+    never overwrites data that already lives in the new directory.
+    """
+    source = Path(source).expanduser()
+    destination = Path(destination).expanduser()
+    try:
+        if source.resolve() == destination.resolve():
+            return []
+    except OSError:
+        pass
+    if not source.is_dir():
+        return []
+
+    copied: list[Path] = []
+    for name in ("presets", "preset_references", "references"):
+        src = source / name
+        if src.is_dir():
+            copied.extend(_copy_missing(src, destination / name))
+    for name in ("settings.json", "voice_profiles.json", "instruction_presets.json"):
+        src = source / name
+        target = destination / name
+        if src.is_file() and not target.exists():
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+            copied.append(target)
+    return copied
+
+
 def _decode_audio(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -183,6 +231,7 @@ class Store:
 
     def __init__(self, data_dir: Path | str = DEFAULT_DATA_DIR) -> None:
         self.data_dir = Path(data_dir).expanduser()
+        self._migrate_legacy_data()
         self.settings_path = self.data_dir / "settings.json"
         self.presets_dir = self.data_dir / "presets"
         self.preset_refs_dir = self.data_dir / "preset_references"
@@ -192,6 +241,19 @@ class Store:
         self.references_dir = self.data_dir / "references"
         self._lock = threading.RLock()
         self._presets_ready = False
+
+    def _migrate_legacy_data(self) -> None:
+        """Bring data from the old home-directory location into .breeze2."""
+        try:
+            is_app_data = self.data_dir.resolve() == APP_DATA_DIR.resolve()
+        except OSError:
+            is_app_data = False
+        if not is_app_data:
+            return
+        try:
+            migrate_data_dir(LEGACY_DATA_DIR, self.data_dir)
+        except OSError:
+            pass
 
     # -- generic JSON helpers -------------------------------------------------
 
@@ -362,6 +424,14 @@ class Store:
             return None
         presets, _ = self.list_presets()
         return presets.get(name)
+
+    def preset_path(self, name: str | None) -> Path | None:
+        """Return the canonical on-disk JSON path for a preset."""
+        if not name:
+            return None
+        with self._lock:
+            self._ensure_presets()
+            return self._find_preset_path(name)
 
     def save_preset(self, name: str, payload: dict[str, Any]) -> str:
         name = (name or "").strip()

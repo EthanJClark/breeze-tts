@@ -190,6 +190,13 @@ def _request_once(
     return (sample_rate, audio), pcm.size / sample_rate
 
 
+def _audio_output(audio, *, reset: bool = False):
+    """Update the audio output, optionally forcing playback back to 0:00."""
+    if reset:
+        return gr.update(value=audio, playback_position=0)
+    return gr.update()
+
+
 def _generation_outputs(
     audio,
     labels: list[str],
@@ -198,16 +205,20 @@ def _generation_outputs(
     summary: str,
     *,
     busy: bool,
+    reset_audio: bool = False,
+    last_seed: int | None = None,
 ):
     selected = labels[-1] if labels else None
     return (
-        audio,
+        _audio_output(audio, reset=reset_audio),
         gr.update(choices=labels, value=selected, visible=len(labels) > 1),
         results,
         status,
         summary,
         gr.update(interactive=not busy),
         gr.update(interactive=busy),
+        last_seed,
+        gr.update(value=str(last_seed) if last_seed is not None else ""),
     )
 
 
@@ -236,7 +247,13 @@ def run_generation(
 
     if not text:
         yield _generation_outputs(
-            None, [], [], "❌ Enter some text to speak.", "", busy=False
+            None,
+            [],
+            [],
+            "❌ Enter some text to speak.",
+            "",
+            busy=False,
+            reset_audio=True,
         )
         return
 
@@ -251,7 +268,9 @@ def run_generation(
             )
         )
     except GenerationError as exc:
-        yield _generation_outputs(None, [], [], f"❌ {exc}", "", busy=False)
+        yield _generation_outputs(
+            None, [], [], f"❌ {exc}", "", busy=False, reset_audio=True
+        )
         return
 
     has_instruction = bool(instruction)
@@ -265,7 +284,13 @@ def run_generation(
         seed_value = int(seed)
     except (TypeError, ValueError):
         yield _generation_outputs(
-            None, [], [], "❌ Invalid generation settings.", "", busy=False
+            None,
+            [],
+            [],
+            "❌ Invalid generation settings.",
+            "",
+            busy=False,
+            reset_audio=True,
         )
         return
 
@@ -299,6 +324,7 @@ def run_generation(
         f"⏳ Generating {take_count} take{'s' if take_count != 1 else ''}…",
         summary,
         busy=True,
+        reset_audio=True,
     )
 
     for index, take_seed in enumerate(seeds, start=1):
@@ -309,6 +335,8 @@ def run_generation(
             f"⏳ Take {index}/{take_count} · seed {take_seed}…",
             summary,
             busy=True,
+            reset_audio=not results,
+            last_seed=results[-1]["seed"] if results else None,
         )
         try:
             audio, duration = _request_once(
@@ -335,6 +363,8 @@ def run_generation(
                 f"❌ {exc}",
                 summary,
                 busy=False,
+                reset_audio=not results,
+                last_seed=results[-1]["seed"] if results else None,
             )
             return
 
@@ -354,6 +384,8 @@ def run_generation(
             f"✅ {label} · {duration:.2f} s",
             summary,
             busy=True,
+            reset_audio=True,
+            last_seed=take_seed,
         )
 
     elapsed = time.perf_counter() - started
@@ -364,6 +396,7 @@ def run_generation(
         f"✅ {take_count} take{'s' if take_count != 1 else ''} in {elapsed:.1f} s",
         summary,
         busy=False,
+        last_seed=results[-1]["seed"],
     )
 
 
@@ -377,14 +410,40 @@ def stop_generation():
 
 def select_take(label: str | None, results: list[dict] | None):
     if not label or not results:
-        return None, "Select a take."
+        return gr.update(), "Select a take.", gr.update(), gr.update()
     for take in results:
         if take["label"] == label:
             return (
-                take["audio"],
+                _audio_output(take["audio"], reset=True),
                 f"Take {take['seed']} · {take['duration']:.2f} s",
+                take["seed"],
+                gr.update(value=str(take["seed"])),
             )
-    return None, "❌ That take is no longer available."
+    return (
+        gr.update(),
+        "❌ That take is no longer available.",
+        gr.update(),
+        gr.update(),
+    )
+
+
+def clear_handler():
+    return (
+        "",
+        _audio_output(None, reset=True),
+        gr.update(choices=[], value=None, visible=False),
+        [],
+        None,
+        gr.update(value=""),
+        "Cleared. Ready.",
+        gr.update(interactive=True),
+        gr.update(interactive=False),
+    )
+
+
+def on_seed_mode_change(mode: str | None):
+    random_mode = (mode or "fixed") == "random"
+    return gr.update(visible=not random_mode), gr.update(visible=random_mode)
 
 
 def _voice_ui(selection: str | None):
@@ -424,6 +483,7 @@ def collect_preset_state(
     seed: float,
     timeout: float,
     autoplay: bool,
+    last_seed: float | None = None,
 ) -> dict:
     name = (name or "").strip()
     if not name:
@@ -461,6 +521,13 @@ def collect_preset_state(
             "Add a voice description or a reference clip before saving."
         )
 
+    effective_seed = int(seed)
+    if seed_mode == "random" and last_seed is not None:
+        try:
+            effective_seed = int(last_seed)
+        except (TypeError, ValueError):
+            pass
+
     return {
         "voice_source": voice,
         "description": description,
@@ -475,7 +542,7 @@ def collect_preset_state(
             "max_duration": max_duration,
             "takes": takes,
             "seed_mode": seed_mode,
-            "seed": seed,
+            "seed": effective_seed,
             "timeout": timeout,
             "autoplay": autoplay,
         },
@@ -517,6 +584,11 @@ def apply_preset_state(name: str, preset: dict, *, store: Store):
     def value(key):
         return settings.get(key, defaults[key])
 
+    seed_mode_value = str(value("seed_mode"))
+    saved_seed = value("seed")
+    random_mode = seed_mode_value == "random"
+    last_seed = saved_seed if random_mode else None
+
     updates = (
         gr.update(value=name),
         gr.update(value=voice),
@@ -531,24 +603,335 @@ def apply_preset_state(name: str, preset: dict, *, store: Store):
         value("repetition_penalty"),
         value("max_duration"),
         value("takes"),
-        value("seed_mode"),
-        value("seed"),
+        seed_mode_value,
+        gr.update(value=saved_seed, visible=not random_mode),
         value("timeout"),
         bool(value("autoplay")),
         *_voice_ui(voice),
+        last_seed,
+        gr.update(
+            value=str(saved_seed) if random_mode else "",
+            visible=random_mode,
+        ),
     )
     return updates, message
 
 
-def apply_preset_handler(name: str | None, *, store: Store):
-    preset = store.load_preset(name)
+PRESET_STATE_UPDATE_COUNT = 22
+
+
+def preset_snapshot(
+    voice: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_duration: float,
+    takes: float,
+    seed_mode: str,
+    seed: float,
+    timeout: float,
+    autoplay: bool,
+) -> dict:
+    """Return a comparable snapshot of the preset-relevant UI fields."""
+
+    def number(value, default: float) -> float:
+        try:
+            return round(float(value), 6)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "voice_source": (voice or VOICE_DESCRIBE).strip(),
+        "description": (description or "").strip(),
+        "reference_audio": str(reference_audio) if reference_audio else None,
+        "reference_text": (reference_text or "").strip(),
+        "delivery": (delivery or "").strip(),
+        "cfg_scale": number(cfg_scale, DEFAULT_SETTINGS["cfg_scale"]),
+        "temperature": number(temperature, DEFAULT_SETTINGS["temperature"]),
+        "top_p": number(top_p, DEFAULT_SETTINGS["top_p"]),
+        "top_k": int(number(top_k, DEFAULT_SETTINGS["top_k"])),
+        "repetition_penalty": number(
+            repetition_penalty, DEFAULT_SETTINGS["repetition_penalty"]
+        ),
+        "max_duration": number(max_duration, DEFAULT_SETTINGS["max_duration"]),
+        "takes": int(number(takes, DEFAULT_SETTINGS["takes"])),
+        "seed_mode": (seed_mode or "fixed").strip(),
+        "seed": int(number(seed, DEFAULT_SETTINGS["seed"])),
+        "timeout": number(timeout, DEFAULT_SETTINGS["timeout"]),
+        "autoplay": bool(autoplay),
+    }
+
+
+def snapshot_from_updates(updates: tuple) -> dict:
+    """Build a baseline snapshot from apply_preset_state's field updates."""
+    return preset_snapshot(
+        updates[1]["value"],
+        updates[2],
+        updates[3],
+        updates[4],
+        updates[5],
+        updates[6],
+        updates[7],
+        updates[8],
+        updates[9],
+        updates[10],
+        updates[11],
+        updates[12],
+        updates[13],
+        updates[14]["value"],
+        updates[15],
+        updates[16],
+    )
+
+
+def _preset_no_change(count: int = PRESET_STATE_UPDATE_COUNT):
+    return tuple(gr.update() for _ in range(count))
+
+
+def _download_update(store: Store, name: str | None):
+    path = store.preset_path(name)
+    if path is None:
+        return gr.update(value=None, interactive=False)
+    return gr.update(value=str(path), interactive=True)
+
+
+def _apply_preset_outputs(name: str, preset: dict, *, store: Store):
+    updates, message = apply_preset_state(name, preset, store=store)
+    return updates, message, _download_update(store, name)
+
+
+def _preset_switch_outputs(
+    dropdown_name: str | None,
+    updates: tuple,
+    message: str,
+    *,
+    pending: str | None,
+    baseline: dict,
+    loaded: str | None,
+    download,
+):
+    return (
+        gr.update(value=dropdown_name),
+        *updates,
+        message,
+        gr.update(visible=False),
+        pending,
+        baseline,
+        loaded,
+        download,
+    )
+
+
+def select_preset_handler(
+    selected: str | None,
+    baseline: dict,
+    loaded: str | None,
+    name: str,
+    voice: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_duration: float,
+    takes: float,
+    seed_mode: str,
+    seed: float,
+    timeout: float,
+    autoplay: bool,
+    *,
+    store: Store,
+):
+    if not selected:
+        return (
+            gr.update(),
+            *_preset_no_change(),
+            "❌ Select a preset to load.",
+            gr.update(),
+            None,
+            baseline,
+            loaded,
+            gr.update(),
+        )
+
+    preset = store.load_preset(selected)
     if preset is None:
         return (
-            *(gr.update() for _ in range(20)),
-            "❌ Select a preset to load.",
+            gr.update(value=loaded),
+            *_preset_no_change(),
+            "❌ Preset not found.",
+            gr.update(visible=False),
+            None,
+            baseline,
+            loaded,
+            gr.update(),
         )
-    updates, message = apply_preset_state(name, preset, store=store)
-    return (*updates, message)
+
+    current = preset_snapshot(
+        voice,
+        description,
+        reference_audio,
+        reference_text,
+        delivery,
+        cfg_scale,
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        max_duration,
+        takes,
+        seed_mode,
+        seed,
+        timeout,
+        autoplay,
+    )
+    if current == baseline:
+        updates, message, download = _apply_preset_outputs(
+            selected, preset, store=store
+        )
+        return _preset_switch_outputs(
+            selected,
+            updates,
+            message,
+            pending=None,
+            baseline=snapshot_from_updates(updates),
+            loaded=selected,
+            download=download,
+        )
+
+    return (
+        gr.update(value=loaded),
+        *_preset_no_change(),
+        f"⚠️ Unsaved changes. Save before loading **{selected}**?",
+        gr.update(visible=True),
+        selected,
+        baseline,
+        loaded,
+        gr.update(),
+    )
+
+
+def resolve_preset_switch(
+    pending: str | None,
+    baseline: dict,
+    loaded: str | None,
+    last_seed: float | None,
+    name: str,
+    voice: str,
+    description: str,
+    reference_audio: str | None,
+    reference_text: str,
+    delivery: str,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    max_duration: float,
+    takes: float,
+    seed_mode: str,
+    seed: float,
+    timeout: float,
+    autoplay: bool,
+    *,
+    action: str,
+    store: Store,
+):
+    if not pending:
+        return (
+            gr.update(value=loaded),
+            *_preset_no_change(),
+            "Select a preset to load.",
+            gr.update(visible=False),
+            None,
+            baseline,
+            loaded,
+            gr.update(),
+        )
+
+    if action == "cancel":
+        return (
+            gr.update(value=loaded),
+            *_preset_no_change(),
+            "Kept current settings.",
+            gr.update(visible=False),
+            None,
+            baseline,
+            loaded,
+            gr.update(),
+        )
+
+    saved_name = None
+    if action == "save":
+        try:
+            payload = collect_preset_state(
+                name,
+                voice,
+                description,
+                reference_audio,
+                reference_text,
+                delivery,
+                cfg_scale,
+                temperature,
+                top_p,
+                top_k,
+                repetition_penalty,
+                max_duration,
+                takes,
+                seed_mode,
+                seed,
+                timeout,
+                autoplay,
+                last_seed=last_seed,
+            )
+            saved_name = store.save_preset(name, payload)
+        except (GenerationError, ValueError, OSError) as exc:
+            return (
+                gr.update(value=loaded),
+                *_preset_no_change(),
+                f"❌ {exc}",
+                gr.update(visible=True),
+                pending,
+                baseline,
+                loaded,
+                gr.update(),
+            )
+
+    preset = store.load_preset(pending)
+    if preset is None:
+        return (
+            gr.update(value=loaded),
+            *_preset_no_change(),
+            "❌ Preset not found.",
+            gr.update(visible=True),
+            pending,
+            baseline,
+            loaded,
+            gr.update(),
+        )
+
+    updates, message, download = _apply_preset_outputs(pending, preset, store=store)
+    if saved_name:
+        message = f"✅ Saved **{saved_name}** and loaded **{pending}**."
+    return _preset_switch_outputs(
+        pending,
+        updates,
+        message,
+        pending=None,
+        baseline=snapshot_from_updates(updates),
+        loaded=pending,
+        download=download,
+    )
 
 
 def save_preset_handler(
@@ -569,6 +952,7 @@ def save_preset_handler(
     seed: float,
     timeout: float,
     autoplay: bool,
+    last_seed: float | None,
     *,
     store: Store,
 ):
@@ -591,71 +975,137 @@ def save_preset_handler(
             seed,
             timeout,
             autoplay,
+            last_seed=last_seed,
         )
         stored = store.save_preset(name, payload)
     except (GenerationError, ValueError, OSError) as exc:
-        return gr.update(), gr.update(), f"❌ {exc}"
+        return (
+            gr.update(),
+            gr.update(),
+            f"❌ {exc}",
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
 
     presets, _ = store.list_presets()
+    baseline = preset_snapshot(
+        voice,
+        description,
+        reference_audio,
+        reference_text,
+        delivery,
+        cfg_scale,
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        max_duration,
+        takes,
+        seed_mode,
+        seed,
+        timeout,
+        autoplay,
+    )
     return (
-        gr.update(choices=sorted(presets), value=stored),
+        gr.update(choices=sorted(presets, key=str.casefold), value=stored),
         gr.update(value=stored),
         f"✅ Saved preset **{stored}**.",
+        baseline,
+        stored,
+        _download_update(store, stored),
     )
 
 
-def delete_preset_handler(name: str | None, *, store: Store):
+def delete_preset_handler(
+    name: str | None, loaded: str | None, *, store: Store
+):
     if not name:
-        return gr.update(), gr.update(), "❌ Select a preset to delete."
+        return (
+            gr.update(),
+            gr.update(),
+            "❌ Select a preset to delete.",
+            loaded,
+            gr.update(),
+        )
     try:
         deleted = store.delete_preset(name)
     except OSError as exc:
-        return gr.update(), gr.update(), f"❌ Could not delete: {exc}"
+        return (
+            gr.update(),
+            gr.update(),
+            f"❌ Could not delete: {exc}",
+            loaded,
+            gr.update(),
+        )
     if not deleted:
-        return gr.update(), gr.update(), "❌ Preset not found."
+        return (
+            gr.update(),
+            gr.update(),
+            "❌ Preset not found.",
+            loaded,
+            gr.update(),
+        )
     presets, _ = store.list_presets()
+    deleting_loaded = loaded == name
+    next_loaded = None if deleting_loaded else loaded
     return (
-        gr.update(choices=sorted(presets), value=None),
-        gr.update(value=""),
+        gr.update(
+            choices=sorted(presets, key=str.casefold), value=next_loaded
+        ),
+        gr.update(value="") if deleting_loaded else gr.update(),
         f"✅ Deleted preset **{name}**.",
-    )
-
-
-def export_preset_handler(name: str | None, *, store: Store):
-    if not name:
-        return gr.update(), "❌ Select a preset to export."
-    try:
-        path = store.export_preset(name)
-    except (OSError, ValueError) as exc:
-        return gr.update(), f"❌ {exc}"
-    return (
-        gr.update(value=str(path), interactive=True),
-        f"✅ Exported **{name}**. Use Download.",
+        next_loaded,
+        _download_update(store, next_loaded),
     )
 
 
 def import_preset_handler(file_path: str | None, *, store: Store):
     if not file_path:
-        return (*(gr.update() for _ in range(22)), "❌ Choose a JSON file.")
+        return (*(gr.update() for _ in range(29)), "❌ Choose a JSON file.")
     try:
         raw = Path(file_path).read_bytes()
         name = store.import_preset(raw, Path(file_path).name)
     except (OSError, ValueError) as exc:
-        return (*(gr.update() for _ in range(22)), f"❌ {exc}")
+        return (*(gr.update() for _ in range(29)), f"❌ {exc}")
 
     presets, _ = store.list_presets()
     preset = presets.get(name)
     if preset is None:
         return (
-            *(gr.update() for _ in range(22)),
+            *(gr.update() for _ in range(29)),
             "❌ Imported preset could not be read.",
         )
-    updates, message = apply_preset_state(name, preset, store=store)
+    updates, message, download = _apply_preset_outputs(name, preset, store=store)
     return (
-        gr.update(choices=sorted(presets), value=name),
+        gr.update(choices=sorted(presets, key=str.casefold), value=name),
         gr.update(value=None),
         *updates,
         message,
+        gr.update(visible=False),
+        None,
+        snapshot_from_updates(updates),
+        name,
+        download,
+    )
+
+
+def refresh_presets_handler(
+    current: str | None, *, store: Store, announce: bool = False
+):
+    presets, warning = store.list_presets()
+    choices = sorted(presets, key=str.casefold)
+    value = current if current in presets else None
+    if warning:
+        message = warning
+    elif announce:
+        message = "✅ Presets refreshed from disk."
+    else:
+        message = gr.update()
+    return (
+        gr.update(choices=choices, value=value),
+        message,
+        _download_update(store, value),
     )
 
 
@@ -706,10 +1156,12 @@ def reset_settings_handler(*, store: Store):
         values["max_duration"],
         values["takes"],
         values["seed_mode"],
-        values["seed"],
+        gr.update(value=values["seed"], visible=True),
         values["timeout"],
         values["autoplay"],
         "Reset to defaults. Click Save settings to persist.",
+        None,
+        gr.update(value="", visible=False),
     )
 
 
@@ -717,7 +1169,28 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
     settings, settings_warning = store.load_settings()
     presets, presets_warning = store.list_presets()
 
-    preset_choices = sorted(presets)
+    preset_choices = sorted(presets, key=str.casefold)
+    initial_baseline = preset_snapshot(
+        VOICE_DESCRIBE,
+        "",
+        None,
+        "",
+        "",
+        settings["cfg_scale"],
+        settings["temperature"],
+        settings["top_p"],
+        settings["top_k"],
+        settings["repetition_penalty"],
+        settings["max_duration"],
+        settings["takes"],
+        settings["seed_mode"],
+        settings["seed"],
+        settings["timeout"],
+        settings["autoplay"],
+    )
+    initial_last_seed = (
+        settings["seed"] if settings["seed_mode"] == "random" else None
+    )
     initial_summary = _summary(
         "Voice design",
         settings["cfg_scale"],
@@ -808,6 +1281,9 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                                 placeholder="Name this preset...",
                                 scale=1,
                             )
+                            refresh_presets_button = gr.Button(
+                                "Refresh", size="sm", scale=0, min_width=80
+                            )
                         with gr.Row():
                             save_preset_button = gr.Button(
                                 "Save preset",
@@ -826,9 +1302,6 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                                 scale=0,
                                 min_width=110,
                             )
-                            export_preset_button = gr.Button(
-                                "Export", size="sm", scale=0, min_width=80
-                            )
                             download_preset = gr.DownloadButton(
                                 "Download JSON",
                                 size="sm",
@@ -836,9 +1309,33 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                                 min_width=130,
                                 interactive=False,
                             )
+                        with gr.Group(visible=False) as preset_confirm_group:
+                            gr.Markdown(
+                                "You have unsaved changes. Save them before switching presets?"
+                            )
+                            with gr.Row():
+                                save_switch_button = gr.Button(
+                                    "Save & switch",
+                                    variant="primary",
+                                    size="sm",
+                                    scale=0,
+                                    min_width=110,
+                                )
+                                discard_switch_button = gr.Button(
+                                    "Discard & switch",
+                                    size="sm",
+                                    scale=0,
+                                    min_width=130,
+                                )
+                                cancel_switch_button = gr.Button(
+                                    "Cancel", size="sm", scale=0, min_width=80
+                                )
                         preset_status = gr.Markdown(
                             presets_warning
-                            or "Presets keep the voice, clip, and settings. The script is not included."
+                            or (
+                                f"Presets are stored in `{store.presets_dir}`. "
+                                "The script is not included."
+                            )
                         )
 
                     with gr.Column(scale=2):
@@ -859,6 +1356,9 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                                 min_width=90,
                                 interactive=False,
                             )
+                            clear_button = gr.Button(
+                                "Clear", size="sm", scale=0, min_width=80
+                            )
                         output_audio = gr.Audio(
                             label="Generated audio",
                             type="numpy",
@@ -872,6 +1372,10 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                         status = gr.Markdown("Ready.")
                         summary = gr.Markdown(initial_summary)
                         takes_state = gr.State([])
+                        last_seed_state = gr.State(initial_last_seed)
+                        baseline_state = gr.State(initial_baseline)
+                        pending_preset_state = gr.State(None)
+                        loaded_preset_state = gr.State(None)
                         with gr.Accordion("Tips", open=False):
                             gr.Markdown(
                                 f"**Vocal events** — type {event_guide} anywhere "
@@ -879,7 +1383,10 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                                 "**Voice** — Describe types a voice in words; Clone "
                                 "uses a clip plus its exact transcript.\n\n"
                                 "**Presets** — Save preset stores the voice, reference "
-                                "clip, and sampling settings, but not the script.\n\n"
+                                "clip, and sampling settings, but not the script. "
+                                "Download JSON grabs the saved file in one click.\n\n"
+                                "**Seeds** — Random mode shows the last seed used. "
+                                "Saving a preset in random mode stores that seed.\n\n"
                                 f"API: `{api_url}`"
                             )
 
@@ -949,7 +1456,21 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                             label="Seed mode",
                         )
                         seed = gr.Number(
-                            value=settings["seed"], precision=0, label="Fixed seed"
+                            value=settings["seed"],
+                            precision=0,
+                            label="Fixed seed",
+                            visible=settings["seed_mode"] != "random",
+                        )
+                        last_seed_display = gr.Textbox(
+                            value=(
+                                str(initial_last_seed)
+                                if initial_last_seed is not None
+                                else ""
+                            ),
+                            label="Last seed",
+                            interactive=False,
+                            visible=settings["seed_mode"] == "random",
+                            info="The actual seed used by the most recent take.",
                         )
                         timeout = gr.Number(
                             value=settings["timeout"],
@@ -975,7 +1496,7 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                             or "Values apply immediately. Save to persist across restarts."
                         )
 
-        preset_state_outputs = [
+        preset_field_components = [
             preset_name,
             voice_source,
             description,
@@ -993,52 +1514,61 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             seed,
             timeout,
             autoplay,
+        ]
+        preset_state_outputs = [
+            *preset_field_components,
             describe_group,
             clone_group,
             delivery_group,
+            last_seed_state,
+            last_seed_display,
+        ]
+        preset_switch_outputs = [
+            preset_dropdown,
+            *preset_state_outputs,
+            preset_status,
+            preset_confirm_group,
+            pending_preset_state,
+            baseline_state,
+            loaded_preset_state,
+            download_preset,
         ]
 
-        preset_dropdown.input(
-            partial(apply_preset_handler, store=store),
-            inputs=preset_dropdown,
-            outputs=[*preset_state_outputs, preset_status],
+        preset_dropdown.select(
+            partial(select_preset_handler, store=store),
+            inputs=[
+                preset_dropdown,
+                baseline_state,
+                loaded_preset_state,
+                *preset_field_components,
+            ],
+            outputs=preset_switch_outputs,
             api_name="apply_preset",
         )
         save_preset_button.click(
             partial(save_preset_handler, store=store),
-            inputs=[
+            inputs=[*preset_field_components, last_seed_state],
+            outputs=[
+                preset_dropdown,
                 preset_name,
-                voice_source,
-                description,
-                reference_audio,
-                reference_text,
-                delivery,
-                cfg_scale,
-                temperature,
-                top_p,
-                top_k,
-                repetition_penalty,
-                max_duration,
-                takes,
-                seed_mode,
-                seed,
-                timeout,
-                autoplay,
+                preset_status,
+                baseline_state,
+                loaded_preset_state,
+                download_preset,
             ],
-            outputs=[preset_dropdown, preset_name, preset_status],
             api_name="save_preset",
         )
         delete_preset_button.click(
             partial(delete_preset_handler, store=store),
-            inputs=preset_dropdown,
-            outputs=[preset_dropdown, preset_name, preset_status],
+            inputs=[preset_dropdown, loaded_preset_state],
+            outputs=[
+                preset_dropdown,
+                preset_name,
+                preset_status,
+                loaded_preset_state,
+                download_preset,
+            ],
             api_name="delete_preset",
-        )
-        export_preset_button.click(
-            partial(export_preset_handler, store=store),
-            inputs=preset_dropdown,
-            outputs=[download_preset, preset_status],
-            api_name="export_preset",
         )
         import_preset_button.upload(
             partial(import_preset_handler, store=store),
@@ -1048,8 +1578,62 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                 import_preset_button,
                 *preset_state_outputs,
                 preset_status,
+                preset_confirm_group,
+                pending_preset_state,
+                baseline_state,
+                loaded_preset_state,
+                download_preset,
             ],
             api_name="import_preset",
+        )
+        refresh_presets_button.click(
+            partial(refresh_presets_handler, store=store, announce=True),
+            inputs=preset_dropdown,
+            outputs=[preset_dropdown, preset_status, download_preset],
+            api_name="refresh_presets",
+        )
+        demo.load(
+            partial(refresh_presets_handler, store=store),
+            inputs=preset_dropdown,
+            outputs=[preset_dropdown, preset_status, download_preset],
+            api_visibility="private",
+        )
+
+        save_switch_button.click(
+            partial(resolve_preset_switch, action="save", store=store),
+            inputs=[
+                pending_preset_state,
+                baseline_state,
+                loaded_preset_state,
+                last_seed_state,
+                *preset_field_components,
+            ],
+            outputs=preset_switch_outputs,
+            api_name="save_and_switch_preset",
+        )
+        discard_switch_button.click(
+            partial(resolve_preset_switch, action="discard", store=store),
+            inputs=[
+                pending_preset_state,
+                baseline_state,
+                loaded_preset_state,
+                last_seed_state,
+                *preset_field_components,
+            ],
+            outputs=preset_switch_outputs,
+            api_name="discard_and_switch_preset",
+        )
+        cancel_switch_button.click(
+            partial(resolve_preset_switch, action="cancel", store=store),
+            inputs=[
+                pending_preset_state,
+                baseline_state,
+                loaded_preset_state,
+                last_seed_state,
+                *preset_field_components,
+            ],
+            outputs=preset_switch_outputs,
+            api_name="cancel_preset_switch",
         )
 
         voice_source.input(
@@ -1093,6 +1677,8 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                 summary,
                 generate_button,
                 stop_button,
+                last_seed_state,
+                last_seed_display,
             ],
             api_name="generate",
         )
@@ -1103,11 +1689,34 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
             queue=False,
             api_name="stop_generation",
         )
+        clear_button.click(
+            clear_handler,
+            outputs=[
+                text,
+                output_audio,
+                take_selector,
+                takes_state,
+                last_seed_state,
+                last_seed_display,
+                status,
+                generate_button,
+                stop_button,
+            ],
+            cancels=[generate_event],
+            queue=False,
+            api_name="clear",
+        )
         take_selector.input(
             select_take,
             inputs=[take_selector, takes_state],
-            outputs=[output_audio, status],
+            outputs=[output_audio, status, last_seed_state, last_seed_display],
             api_name="select_take",
+        )
+        seed_mode.change(
+            on_seed_mode_change,
+            inputs=seed_mode,
+            outputs=[seed, last_seed_display],
+            api_name="change_seed_mode",
         )
 
         autoplay.change(
@@ -1149,6 +1758,8 @@ def build_demo(api_url: str, store: Store, frame_rate: float) -> gr.Blocks:
                 timeout,
                 autoplay,
                 settings_status,
+                last_seed_state,
+                last_seed_display,
             ],
             api_name="reset_settings",
         )
@@ -1169,7 +1780,10 @@ def main() -> None:
         "--data-dir",
         type=Path,
         default=DEFAULT_DATA_DIR,
-        help="Directory for settings, presets, and saved voices (default: %(default)s)",
+        help=(
+            "Directory for settings, presets, and saved voices. Defaults to "
+            ".breeze2 next to webui.py (default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--share", action="store_true", help="Create a public Gradio link"
